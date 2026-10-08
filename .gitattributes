@@ -1,1 +1,2 @@
 models/jewellery_dinov2.pth filter=lfs diff=lfs merge=lfs -text
+models/jewellery_dinov2.onnx.data filter=lfs diff=lfs merge=lfs -text
