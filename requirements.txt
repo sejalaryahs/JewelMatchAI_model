@@ -1,13 +1,22 @@
-torch
-torchvision
-transformers
-opencv-python-headless
-numpy
-Pillow
-scikit-learn
-tqdm
+# torch
+# torchvision
+# transformers
+# opencv-python-headless
+# numpy
+# Pillow
+# scikit-learn
+# tqdm
+# flask
+# flask-cors
+# safetensors
+# gunicorn
+# pymongo
+
 flask
 flask-cors
-safetensors
 gunicorn
+onnxruntime
+numpy
+Pillow
 pymongo
+scikit-learn

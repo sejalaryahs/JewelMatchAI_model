@@ -1,176 +1,246 @@
 from pathlib import Path
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import numpy as np
+import onnxruntime as ort
+from PIL import Image
 
-from transformers import AutoModel, AutoImageProcessor
-
+# ============================================================
+# PATHS
+# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-MODEL_PATH = (
-    PROJECT_ROOT
-    / "models"
-    / "jewellery_dinov2.pth"
+MODEL_PATH = PROJECT_ROOT / "models" / "jewellery_dinov2.onnx"
+
+
+# ============================================================
+# IMAGE PREPROCESSING
+#
+# Must match the preprocessing used during training:
+#
+# Resize 256
+# Center Crop 224
+# RGB
+# ToTensor
+# ImageNet normalization
+# ============================================================
+
+IMAGE_SIZE = 224
+RESIZE_SIZE = 256
+
+IMAGE_MEAN = np.array(
+    [
+        0.485,
+        0.456,
+        0.406,
+    ],
+    dtype=np.float32,
 )
 
-DINO_MODEL_NAME = "facebook/dinov2-base"
+IMAGE_STD = np.array(
+    [
+        0.229,
+        0.224,
+        0.225,
+    ],
+    dtype=np.float32,
+)
 
-EMBEDDING_DIM = 512
 
-
-class JewelleryDINOv2(nn.Module):
-
-    def __init__(self):
-
-        super().__init__()
-
-        self.backbone = AutoModel.from_pretrained(
-            DINO_MODEL_NAME
-        )
-
-        self.embedding_head = nn.Sequential(
-            nn.Linear(
-                768,
-                EMBEDDING_DIM,
-            ),
-            nn.LayerNorm(
-                EMBEDDING_DIM
-            ),
-            nn.GELU(),
-            nn.Dropout(
-                0.10
-            ),
-            nn.Linear(
-                EMBEDDING_DIM,
-                EMBEDDING_DIM,
-            ),
-        )
-
-        self.projection_head = nn.Sequential(
-            nn.Linear(
-                EMBEDDING_DIM,
-                EMBEDDING_DIM,
-            ),
-            nn.GELU(),
-            nn.Linear(
-                EMBEDDING_DIM,
-                256,
-            ),
-        )
-
-    def forward(
-        self,
-        pixel_values,
-    ):
-
-        outputs = self.backbone(
-            pixel_values=pixel_values
-        )
-
-        cls_token = (
-            outputs.last_hidden_state[:, 0, :]
-        )
-
-        embedding = self.embedding_head(
-            cls_token
-        )
-
-        embedding = F.normalize(
-            embedding,
-            dim=1,
-        )
-
-        projection = self.projection_head(
-            embedding
-        )
-
-        projection = F.normalize(
-            projection,
-            dim=1,
-        )
-
-        return embedding, projection
+# ============================================================
+# ONNX MODEL LOADER
+# ============================================================
 
 
 class ModelLoader:
 
     def __init__(self):
 
-        self.device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
-
         print()
         print("=" * 70)
-        print("LOADING JEWELLERY DINOv2")
+        print("LOADING JEWELLERY DINOv2 ONNX")
         print("=" * 70)
 
-        print(
-            f"Device: {self.device}"
-        )
+        # ----------------------------------------------------
+        # Check model
+        # ----------------------------------------------------
 
         if not MODEL_PATH.exists():
 
-            raise FileNotFoundError(
-                f"Trained model not found:\n"
-                f"{MODEL_PATH}\n\n"
-                f"Train the model first."
-            )
+            raise FileNotFoundError(f"ONNX model not found:\n{MODEL_PATH}")
 
-        self.processor = (
-            AutoImageProcessor.from_pretrained(
-                DINO_MODEL_NAME
-            )
+        print(f"Model: {MODEL_PATH}")
+
+        # ----------------------------------------------------
+        # ONNX Runtime
+        # ----------------------------------------------------
+
+        print()
+        print("Loading ONNX Runtime...")
+
+        self.session = ort.InferenceSession(
+            str(MODEL_PATH),
+            providers=["CPUExecutionProvider"],
         )
 
-        self.model = JewelleryDINOv2()
+        # ----------------------------------------------------
+        # Input / output names
+        # ----------------------------------------------------
 
-        checkpoint = torch.load(
-            MODEL_PATH,
-            map_location=self.device,
-            weights_only=False,
-        )
+        self.input_name = self.session.get_inputs()[0].name
 
-        self.model.load_state_dict(
-            checkpoint[
-                "model_state_dict"
-            ]
-        )
+        self.output_name = self.session.get_outputs()[0].name
 
-        self.model.to(
-            self.device
-        )
+        print(f"Input: {self.input_name}")
+        print(f"Output: {self.output_name}")
 
-        self.model.eval()
+        print()
+        print("✓ ONNX model loaded successfully")
 
-        print(
-            "Jewellery DINOv2 loaded successfully."
-        )
-
+        print()
+        print("=" * 70)
+        print("DINOv2 ONNX READY")
         print("=" * 70)
 
-    @torch.no_grad()
-    def get_embedding(
-        self,
-        image,
-    ):
+    # ========================================================
+    # IMAGE PREPROCESSING
+    # ========================================================
 
-        inputs = self.processor(
-            images=image,
-            return_tensors="pt",
+    def preprocess(self, image):
+
+        # ----------------------------------------------------
+        # Convert to PIL Image
+        # ----------------------------------------------------
+
+        if not isinstance(image, Image.Image):
+
+            image = Image.fromarray(image)
+
+        image = image.convert("RGB")
+
+        # ----------------------------------------------------
+        # Resize
+        #
+        # torchvision.transforms.Resize(256) with an integer
+        # keeps the aspect ratio and makes the shorter side
+        # equal to 256.
+        # ----------------------------------------------------
+
+        width, height = image.size
+
+        if width < height:
+
+            new_width = RESIZE_SIZE
+
+            new_height = int(round(height * RESIZE_SIZE / width))
+
+        else:
+
+            new_height = RESIZE_SIZE
+
+            new_width = int(round(width * RESIZE_SIZE / height))
+
+        image = image.resize(
+            (new_width, new_height),
+            Image.Resampling.BILINEAR,
         )
 
-        pixel_values = (
-            inputs["pixel_values"]
-            .to(self.device)
+        # ----------------------------------------------------
+        # Center Crop 224 x 224
+        # ----------------------------------------------------
+
+        width, height = image.size
+
+        left = (width - IMAGE_SIZE) // 2
+        top = (height - IMAGE_SIZE) // 2
+
+        right = left + IMAGE_SIZE
+        bottom = top + IMAGE_SIZE
+
+        image = image.crop((left, top, right, bottom))
+
+        # ----------------------------------------------------
+        # Convert to NumPy
+        #
+        # PIL:
+        #   H x W x C
+        #
+        # ONNX:
+        #   C x H x W
+        # ----------------------------------------------------
+
+        image_array = np.asarray(
+            image,
+            dtype=np.float32,
         )
 
-        embedding, _ = self.model(
-            pixel_values
+        # ----------------------------------------------------
+        # ToTensor equivalent
+        #
+        # torchvision ToTensor() converts:
+        #
+        # uint8 0-255
+        #
+        # into:
+        #
+        # float32 0-1
+        # ----------------------------------------------------
+
+        image_array = image_array / 255.0
+
+        # ----------------------------------------------------
+        # ImageNet normalization
+        # ----------------------------------------------------
+
+        image_array = (image_array - IMAGE_MEAN) / IMAGE_STD
+
+        # ----------------------------------------------------
+        # HWC -> CHW
+        # ----------------------------------------------------
+
+        image_array = np.transpose(
+            image_array,
+            (2, 0, 1),
         )
 
-        return embedding[0].cpu().numpy()
+        # ----------------------------------------------------
+        # Add batch dimension
+        #
+        # C x H x W
+        #       ↓
+        # 1 x C x H x W
+        # ----------------------------------------------------
+
+        image_array = np.expand_dims(
+            image_array,
+            axis=0,
+        )
+
+        return image_array.astype(np.float32)
+
+    # ========================================================
+    # GET EMBEDDING
+    # ========================================================
+
+    def get_embedding(self, image):
+
+        pixel_values = self.preprocess(image)
+
+        outputs = self.session.run(
+            [self.output_name],
+            {self.input_name: pixel_values},
+        )
+
+        embedding = outputs[0][0]
+
+        # ----------------------------------------------------
+        # Safety normalization
+        # ----------------------------------------------------
+
+        norm = np.linalg.norm(embedding)
+
+        if norm > 0:
+
+            embedding = embedding / norm
+
+        return embedding.astype(np.float32)
