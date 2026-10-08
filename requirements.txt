@@ -20,3 +20,4 @@ numpy
 Pillow
 pymongo
 scikit-learn
+opencv-python-headless
