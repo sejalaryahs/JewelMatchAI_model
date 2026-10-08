@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Python cache / logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Training datasets
+dataset/
+processed/
+processed_segmented/
+training/
+
+# Temporary matching test data
+matching_data/
+
+# Backend uploads
+backend/uploads/
+
+# Hugging Face / model caches
+cache/
+.cache/
+huggingface/
+model_cache/
+
+# Node
+node_modules/
+dist/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Temporary segmentation test images
+segmentation_mask.png
+segmentation_original.jpg
+segmentation_result.jpg
+
+# Training/preprocessing scripts
+preprocessing/
+
+# Frontend is not deployed with the AI API
+frontend/
