@@ -1,0 +1,13 @@
+torch
+torchvision
+transformers
+opencv-python-headless
+numpy
+Pillow
+scikit-learn
+tqdm
+flask
+flask-cors
+safetensors
+gunicorn
+pymongo
