@@ -1,3 +1,4 @@
+import gc
 from pathlib import Path
 
 from bson import ObjectId
@@ -60,16 +61,13 @@ def health():
 # ============================================================
 
 
-@app.route(
-    "/api/match",
-    methods=["POST"],
-)
+@app.route("/api/match", methods=["POST"])
 def match():
+    image = None
+    image_file = None
 
     try:
-
         if "image" not in request.files:
-
             return (
                 jsonify(
                     {
@@ -91,18 +89,12 @@ def match():
             .lower()
         )
 
-        top_k = int(
-            request.form.get(
-                "top_k",
-                5,
-            )
-        )
+        try:
+            top_k = int(request.form.get("top_k", 5))
+        except (TypeError, ValueError):
+            top_k = 5
 
-        if source not in {
-            "gold",
-            "prototype",
-        }:
-
+        if source not in {"gold", "prototype"}:
             return (
                 jsonify(
                     {
@@ -113,17 +105,10 @@ def match():
                 400,
             )
 
-        image = Image.open(image_file.stream).convert("RGB")
-
-        # ----------------------------------------------------
-        # CURRENT JEWELLERY IMAGE PREPROCESSING
-        # ----------------------------------------------------
+        with Image.open(image_file.stream) as uploaded_image:
+            image = uploaded_image.convert("RGB")
 
         image = prepare_ring_image(image)
-
-        # ----------------------------------------------------
-        # FIND MATCHES
-        # ----------------------------------------------------
 
         results = matcher.find_matches(
             image=image,
@@ -143,7 +128,6 @@ def match():
         )
 
     except Exception as exc:
-
         print(f"[ERROR] /api/match: {exc}")
 
         return (
@@ -155,6 +139,26 @@ def match():
             ),
             500,
         )
+
+    finally:
+        # Close the processed image, if one was created.
+        if image is not None:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+        # Close the uploaded request stream.
+        if image_file is not None:
+            try:
+                image_file.close()
+            except Exception:
+                pass
+
+        # Collect unreachable temporary Python objects.
+        gc.collect()
+
+        print("[CLEANUP] Request image and temporary objects released.")
 
 
 # ============================================================
