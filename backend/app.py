@@ -1,14 +1,18 @@
 from pathlib import Path
 
+from bson import ObjectId
 from flask import (
     Flask,
     jsonify,
     request,
+    send_file,
     send_from_directory,
 )
 from flask_cors import CORS
+from gridfs import GridFS
 from PIL import Image
 
+from .database.mongodb import get_jewellery_collection
 from .model_loader import ModelLoader
 from .matcher import JewelleryMatcher
 from .segmentation import prepare_ring_image
@@ -46,7 +50,7 @@ def health():
     return jsonify(
         {
             "status": "ok",
-            "message": ("Jewellery Matcher API is running"),
+            "message": "Jewellery Matcher API is running",
         }
     )
 
@@ -70,7 +74,7 @@ def match():
                 jsonify(
                     {
                         "success": False,
-                        "error": ("No image was uploaded."),
+                        "error": "No image was uploaded.",
                     }
                 ),
                 400,
@@ -103,7 +107,7 @@ def match():
                 jsonify(
                     {
                         "success": False,
-                        "error": ("Source must be " "'gold' or 'prototype'."),
+                        "error": "Source must be 'gold' or 'prototype'.",
                     }
                 ),
                 400,
@@ -111,8 +115,15 @@ def match():
 
         image = Image.open(image_file.stream).convert("RGB")
 
-        # Current preprocessing layer.
+        # ----------------------------------------------------
+        # CURRENT JEWELLERY IMAGE PREPROCESSING
+        # ----------------------------------------------------
+
         image = prepare_ring_image(image)
+
+        # ----------------------------------------------------
+        # FIND MATCHES
+        # ----------------------------------------------------
 
         results = matcher.find_matches(
             image=image,
@@ -147,7 +158,134 @@ def match():
 
 
 # ============================================================
-# SERVE CATALOGUE IMAGES
+# SERVE MONGODB / GRIDFS CATALOGUE IMAGE
+# ============================================================
+
+
+@app.route(
+    "/catalogue-image/stored/<gridfs_id>",
+    methods=["GET"],
+)
+def catalogue_image_stored(
+    gridfs_id,
+):
+
+    try:
+
+        # ----------------------------------------------------
+        # VALIDATE MONGODB OBJECT ID
+        # ----------------------------------------------------
+
+        try:
+
+            object_id = ObjectId(gridfs_id)
+
+        except Exception:
+
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Invalid GridFS image ID.",
+                    }
+                ),
+                400,
+            )
+
+        # ----------------------------------------------------
+        # GET SAME MONGODB DATABASE
+        # ----------------------------------------------------
+
+        database = get_jewellery_collection().database
+
+        # ----------------------------------------------------
+        # GRIDFS
+        # ----------------------------------------------------
+
+        gridfs = GridFS(database)
+
+        # ----------------------------------------------------
+        # CHECK IMAGE
+        # ----------------------------------------------------
+
+        if not gridfs.exists(object_id):
+
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Stored image not found.",
+                    }
+                ),
+                404,
+            )
+
+        # ----------------------------------------------------
+        # READ GRIDFS FILE
+        # ----------------------------------------------------
+
+        grid_file = gridfs.get(object_id)
+
+        # ----------------------------------------------------
+        # DETERMINE CONTENT TYPE
+        # ----------------------------------------------------
+
+        content_type = getattr(
+            grid_file,
+            "content_type",
+            None,
+        )
+
+        # ----------------------------------------------------
+        # SEND IMAGE TO BROWSER
+        # ----------------------------------------------------
+
+        response = send_file(
+            grid_file,
+            mimetype=content_type,
+            download_name=(
+                grid_file.filename
+                if getattr(
+                    grid_file,
+                    "filename",
+                    None,
+                )
+                else "jewellery-image"
+            ),
+        )
+
+        # ----------------------------------------------------
+        # CACHE IMAGE
+        # ----------------------------------------------------
+
+        response.headers["Cache-Control"] = "public, max-age=31536000"
+
+        return response
+
+    except Exception as exc:
+
+        print(
+            "[ERROR] GridFS image error:",
+            repr(exc),
+        )
+
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": str(exc),
+                }
+            ),
+            500,
+        )
+
+
+# ============================================================
+# OLD LOCAL CATALOGUE IMAGE ROUTE
+#
+# Kept temporarily for backwards compatibility.
+# The React application now uses the MongoDB/GridFS route
+# above.
 # ============================================================
 
 
@@ -181,6 +319,7 @@ def catalogue_image(
 # ============================================================
 # RUN
 # ============================================================
+
 
 if __name__ == "__main__":
 
