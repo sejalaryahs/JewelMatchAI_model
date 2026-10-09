@@ -1,19 +1,8 @@
 # ============================================================
 # JEWELMATCH AI - MONGODB STORED-EMBEDDING MATCHER
-#
-# Preserves:
-# - MongoDB gold and prototype collections
-# - Existing trained ONNX ModelLoader
-# - 512-dimensional embeddings
-# - Cosine similarity and descending ranking
-# - Existing matching result fields and metadata
-#
-# Optimized:
-# - Loads precomputed embeddings from MongoDB
-# - Does not generate embeddings for catalogue images
-# - Does not download catalogue images from GridFS
-# - Keeps only one target catalogue in memory
 # ============================================================
+
+import gc
 
 import numpy as np
 from bson import ObjectId
@@ -26,14 +15,10 @@ class JewelleryMatcher:
     """Match jewellery using embeddings stored in MongoDB."""
 
     EMBEDDING_DIM = 512
-
-    # Must match the version stored by backend/store_embeddings.py.
     MODEL_VERSION = "jewellery_dinov2_onnx_v1:cdae8a24b1a605da"
 
     def __init__(self, model_loader: ModelLoader):
         self.model_loader = model_loader
-
-        # MongoDB database and collections.
         self.database = get_jewellery_collection().database
 
         self.collections = {
@@ -41,7 +26,6 @@ class JewelleryMatcher:
             "prototype": self.database["prototype"],
         }
 
-        # One target catalogue is cached at a time.
         self.catalogue = {
             "gold": [],
             "prototype": [],
@@ -64,14 +48,10 @@ class JewelleryMatcher:
             "Prototype records: " f"{self.collections['prototype'].count_documents({})}"
         )
         print(f"Embedding model  : {self.MODEL_VERSION}")
-        print("[INFO] Catalogue embeddings will be read from MongoDB.")
-        print("[INFO] Catalogue images will not be re-embedded.")
-        print("[INFO] Only one target catalogue will be cached.")
+        print("[INFO] Catalogue embeddings are read from MongoDB.")
+        print("[INFO] Catalogue images are not re-embedded.")
+        print("[INFO] Catalogue cache is cleared after each match.")
         print("=" * 70)
-
-    # ========================================================
-    # GET GRIDFS ID
-    # ========================================================
 
     def _get_gridfs_id(self, item):
         if not item:
@@ -85,38 +65,18 @@ class JewelleryMatcher:
         try:
             if isinstance(value, ObjectId):
                 return value
-
             return ObjectId(str(value))
-
         except Exception:
             return None
 
-    # ========================================================
-    # GET ITEM DISPLAY ID
-    # ========================================================
-
     def _get_item_id(self, item):
-        for field in (
-            "id",
-            "design_id",
-            "jewellery_id",
-            "item_id",
-        ):
+        for field in ("id", "design_id", "jewellery_id", "item_id"):
             value = item.get(field)
-
             if value is not None:
                 return str(value)
 
         mongo_id = item.get("_id")
-
-        if mongo_id is not None:
-            return str(mongo_id)
-
-        return None
-
-    # ========================================================
-    # GET IMAGE FILENAME
-    # ========================================================
+        return str(mongo_id) if mongo_id is not None else None
 
     def _get_filename(self, item):
         for field in (
@@ -126,22 +86,13 @@ class JewelleryMatcher:
             "image_name",
         ):
             value = item.get(field)
-
             if value:
                 return str(value)
 
         return None
 
-    # ========================================================
-    # CREATE QUERY EMBEDDING
-    # ========================================================
-
     def _create_embedding(self, image):
-        """
-        Generate an embedding only for the incoming query image.
-        The existing trained ONNX model and preprocessing remain
-        unchanged.
-        """
+        """Generate an embedding for the uploaded query image."""
         embedding = self.model_loader.get_embedding(image)
 
         embedding = np.asarray(
@@ -151,9 +102,8 @@ class JewelleryMatcher:
 
         if embedding.size != self.EMBEDDING_DIM:
             raise ValueError(
-                "Unexpected embedding dimension: "
-                f"expected {self.EMBEDDING_DIM}, "
-                f"received {embedding.size}"
+                f"Unexpected embedding dimension: expected "
+                f"{self.EMBEDDING_DIM}, received {embedding.size}"
             )
 
         if not np.all(np.isfinite(embedding)):
@@ -164,17 +114,11 @@ class JewelleryMatcher:
         if norm <= 0:
             raise ValueError("Query embedding has zero magnitude.")
 
-        # Normalize so matrix multiplication computes cosine similarity.
-        embedding = embedding / norm
-
-        return embedding.astype(np.float32, copy=False)
-
-    # ========================================================
-    # CLEAR CATALOGUE CACHE
-    # ========================================================
+        normalized = embedding / norm
+        return normalized.astype(np.float32, copy=False)
 
     def _clear_catalogue_cache(self):
-        """Release references to the previous target catalogue."""
+        """Remove references to cached catalogue records and vectors."""
         self.catalogue["gold"] = []
         self.catalogue["prototype"] = []
 
@@ -183,17 +127,8 @@ class JewelleryMatcher:
 
         self._loaded_domain = None
 
-    # ========================================================
-    # LOAD STORED EMBEDDINGS
-    # ========================================================
-
     def _load_catalogue(self, domain):
-        """
-        Read precomputed embedding vectors from MongoDB.
-
-        This method intentionally does not read GridFS image bytes
-        and does not call the ONNX model for catalogue records.
-        """
+        """Load validated precomputed embeddings from MongoDB."""
         if domain not in ("gold", "prototype"):
             raise ValueError("domain must be 'gold' or 'prototype'")
 
@@ -213,18 +148,13 @@ class JewelleryMatcher:
         invalid_embedding = 0
         missing_image_id = 0
 
-        # Read one MongoDB document at a time.
         for item in collection.find({}):
             total_records += 1
 
-            # Only accept vectors generated by the expected ONNX model.
-            stored_model = item.get("embedding_model")
-
-            if stored_model != self.MODEL_VERSION:
+            if item.get("embedding_model") != self.MODEL_VERSION:
                 wrong_model += 1
                 continue
 
-            # Each catalogue document must have a stored vector.
             stored_embedding = item.get("embedding")
 
             if stored_embedding is None:
@@ -251,25 +181,18 @@ class JewelleryMatcher:
                     invalid_embedding += 1
                     continue
 
-                # Stored vectors should already be normalized.
-                # Normalize again to protect cosine-similarity ranking
-                # against small floating-point differences.
                 vector = vector / norm
-
                 gridfs_id = self._get_gridfs_id(item)
 
                 if gridfs_id is None:
                     missing_image_id += 1
 
-                # Preserve the original MongoDB document and output
-                # metadata without copying the image data.
                 valid_records.append(
                     {
                         "record": item,
                         "gridfs_id": gridfs_id,
                     }
                 )
-
                 vectors.append(vector)
 
             except (TypeError, ValueError, OverflowError) as exc:
@@ -290,7 +213,6 @@ class JewelleryMatcher:
                 dtype=np.float32,
             )
 
-        # Publish the completed cache.
         self.catalogue[domain] = valid_records
         self.embeddings[domain] = matrix
         self._loaded_domain = domain
@@ -309,12 +231,8 @@ class JewelleryMatcher:
                 "Check embedding_model and embedding fields."
             )
 
-        print(f"[INFO] Cached target catalogue: {domain}")
+        print(f"[INFO] Target catalogue loaded: {domain}")
         print("=" * 70)
-
-    # ========================================================
-    # ENSURE TARGET CATALOGUE IS LOADED
-    # ========================================================
 
     def _ensure_catalogue_loaded(self, target):
         if target not in ("gold", "prototype"):
@@ -323,112 +241,121 @@ class JewelleryMatcher:
         if self._loaded_domain == target and self.embeddings[target] is not None:
             return
 
-        print(f"[INFO] Preparing target catalogue: {target}")
-
-        # Free references to the previous catalogue before loading
-        # the requested one.
         self._clear_catalogue_cache()
         self._load_catalogue(target)
 
-    # ========================================================
-    # MATCH
-    # ========================================================
-
     def find_matches(self, image, source, top_k=5):
-        if source not in ("gold", "prototype"):
-            raise ValueError("source must be 'gold' or 'prototype'")
-
-        try:
-            top_k = int(top_k)
-        except (TypeError, ValueError):
-            top_k = 5
-
-        top_k = max(1, min(top_k, 50))
-
-        # Gold searches prototypes; prototypes search gold.
-        target = "prototype" if source == "gold" else "gold"
-
-        print()
-        print("=" * 70)
-        print("JEWELLERY MATCH")
-        print("=" * 70)
-        print(f"Source : {source}")
-        print(f"Target : {target}")
-
-        # Generate an embedding only for the uploaded image.
-        query_embedding = self._create_embedding(image)
-
-        # Read stored vectors for the target catalogue.
-        self._ensure_catalogue_loaded(target)
-
-        catalogue_embeddings = self.embeddings[target]
-        catalogue_records = self.catalogue[target]
-
-        print(f"Target records: {len(catalogue_records)}")
-
-        if not catalogue_records:
-            print(f"[INFO] No usable {target} embeddings available.")
-            print("=" * 70)
-            return []
-
-        # Cosine similarity: normalized vectors multiplied together.
-        similarities = catalogue_embeddings @ query_embedding
-
-        # Rank from highest similarity to lowest.
-        ranking = np.argsort(similarities)[::-1][:top_k]
-
+        """Match one uploaded image and clear temporary cache afterwards."""
+        query_embedding = None
+        catalogue_embeddings = None
+        catalogue_records = None
+        similarities = None
+        ranking = None
         results = []
 
-        for index in ranking:
-            index = int(index)
+        try:
+            if source not in ("gold", "prototype"):
+                raise ValueError("source must be 'gold' or 'prototype'")
 
-            item_data = catalogue_records[index]
-            item = item_data["record"]
-            gridfs_id = item_data["gridfs_id"]
+            try:
+                top_k = int(top_k)
+            except (TypeError, ValueError):
+                top_k = 5
 
-            similarity = float(similarities[index])
+            top_k = max(1, min(top_k, 50))
+            target = "prototype" if source == "gold" else "gold"
 
-            result = {
-                "id": self._get_item_id(item),
-                "mongo_id": str(item.get("_id")),
-                "filename": self._get_filename(item),
-                "domain": target,
-                "image_gridfs_id": (str(gridfs_id) if gridfs_id is not None else None),
-                "similarity": similarity,
-                "similarity_percent": round(
-                    max(0.0, min(1.0, similarity)) * 100,
-                    2,
-                ),
-            }
+            print()
+            print("=" * 70)
+            print("JEWELLERY MATCH")
+            print("=" * 70)
+            print(f"Source : {source}")
+            print(f"Target : {target}")
 
-            # Preserve the existing metadata fields.
-            metadata_fields = (
-                "design_id",
-                "name",
-                "design_name",
-                "type",
-                "subtype",
-                "description",
-                "collection",
-            )
+            query_embedding = self._create_embedding(image)
+            self._ensure_catalogue_loaded(target)
 
-            for field in metadata_fields:
-                if field in item:
-                    value = item[field]
+            catalogue_embeddings = self.embeddings[target]
+            catalogue_records = self.catalogue[target]
 
-                    if isinstance(value, ObjectId):
-                        value = str(value)
+            print(f"Target records: {len(catalogue_records)}")
 
-                    result[field] = value
+            if not catalogue_records:
+                print(f"[INFO] No usable {target} embeddings available.")
+                return []
 
-            results.append(result)
+            # Preserve the existing cosine-similarity and ranking logic.
+            similarities = catalogue_embeddings @ query_embedding
+            ranking = np.argsort(similarities)[::-1][:top_k]
 
-        print()
-        print(f"Valid matches: {len(results)}")
+            for index in ranking:
+                index = int(index)
 
-        for rank, result in enumerate(results, start=1):
-            print(f"{rank}. {result.get('id')} -> " f"{result['similarity_percent']}%")
+                item_data = catalogue_records[index]
+                item = item_data["record"]
+                gridfs_id = item_data["gridfs_id"]
+                similarity = float(similarities[index])
 
-        print("=" * 70)
+                result = {
+                    "id": self._get_item_id(item),
+                    "mongo_id": str(item.get("_id")),
+                    "filename": self._get_filename(item),
+                    "domain": target,
+                    "image_gridfs_id": (
+                        str(gridfs_id) if gridfs_id is not None else None
+                    ),
+                    "similarity": similarity,
+                    "similarity_percent": round(
+                        max(0.0, min(1.0, similarity)) * 100,
+                        2,
+                    ),
+                }
 
-        return results
+                for field in (
+                    "design_id",
+                    "name",
+                    "design_name",
+                    "type",
+                    "subtype",
+                    "description",
+                    "collection",
+                ):
+                    if field in item:
+                        value = item[field]
+
+                        if isinstance(value, ObjectId):
+                            value = str(value)
+
+                        result[field] = value
+
+                results.append(result)
+
+            print(f"Valid matches: {len(results)}")
+
+            for rank, result in enumerate(results, start=1):
+                print(
+                    f"{rank}. {result.get('id')} -> " f"{result['similarity_percent']}%"
+                )
+
+            print("=" * 70)
+
+            # Return independent result dictionaries. They do not depend
+            # on the catalogue cache after this method returns.
+            return results
+
+        finally:
+            # Remove references to temporary NumPy arrays.
+            query_embedding = None
+            catalogue_embeddings = None
+            catalogue_records = None
+            similarities = None
+            ranking = None
+
+            # Clear both in-memory catalogue caches. MongoDB data is
+            # untouched and will be loaded again for the next request.
+            self._clear_catalogue_cache()
+
+            # Ask Python to collect unreachable objects.
+            gc.collect()
+
+            print("[CLEANUP] Matching arrays and catalogue cache cleared.")
