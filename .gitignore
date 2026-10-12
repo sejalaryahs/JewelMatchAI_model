@@ -60,3 +60,10 @@ preprocessing/
 
 # Frontend is not deployed with the AI API
 frontend/
+
+# Local backup and experimental files
+*.backup
+*.bak
+backend/store_embeddings.py
+models/ring_embedding_model.pth
+models/ring_embedding_model_old_loss.pth
