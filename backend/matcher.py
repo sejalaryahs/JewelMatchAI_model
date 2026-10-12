@@ -244,7 +244,7 @@ class JewelleryMatcher:
         self._clear_catalogue_cache()
         self._load_catalogue(target)
 
-    def find_matches(self, image, source, top_k=5):
+    def find_matches(self, image, source, top_k=12):
         """Match one uploaded image and clear temporary cache afterwards."""
         query_embedding = None
         catalogue_embeddings = None
