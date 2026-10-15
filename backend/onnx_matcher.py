@@ -1,3 +1,4 @@
+import gc
 import threading
 from pathlib import Path
 
@@ -8,14 +9,23 @@ from PIL import Image
 from .database.mongodb import get_catalogue_collection
 from .segmentation import prepare_ring_image
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 MODEL_PATH = PROJECT_ROOT / "models" / "jewellery_dinov2_segmented_experiment.onnx"
 
 MODEL_ID = "segmented_dinov2_experiment:734b7306a8f1cb1e"
+
 EMBEDDING_DIM = 512
 IMAGE_SIZE = 224
 RESIZE_SIZE = 256
+
+# Number of catalogue vectors to retain in memory.
+# Catalogue embeddings are loaded separately for each collection.
+MAX_CACHED_COLLECTIONS = 1
 
 IMAGENET_MEAN = np.array(
     [0.485, 0.456, 0.406],
@@ -28,19 +38,31 @@ IMAGENET_STD = np.array(
 ).reshape(1, 1, 3)
 
 
+# ============================================================
+# IMAGE PREPROCESSING
+# ============================================================
+
+
 def preprocess_image(image: Image.Image) -> np.ndarray:
     """
-    Convert a segmented PIL image to normalized NCHW float32 input.
+    Prepare a segmented image for the DINOv2 ONNX model.
 
-    The preprocessing follows the usual DINOv2 ImageNet input pipeline:
-    resize the shorter side to 256, center-crop to 224, convert to RGB,
-    and normalize using ImageNet mean and standard deviation.
+    Steps:
+      1. Convert to RGB.
+      2. Resize the shorter side to 256.
+      3. Center-crop to 224 x 224.
+      4. Normalize using ImageNet statistics.
+      5. Convert HWC to NCHW.
+
+    Returns:
+        float32 NumPy array with shape (1, 3, 224, 224).
     """
     image = image.convert("RGB")
 
     width, height = image.size
+
     if width <= 0 or height <= 0:
-        raise ValueError("The image has invalid dimensions.")
+        raise ValueError("Image has invalid dimensions.")
 
     scale = RESIZE_SIZE / min(width, height)
 
@@ -65,6 +87,7 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
     )
 
     array = np.asarray(image, dtype=np.float32) / 255.0
+
     array = (array - IMAGENET_MEAN) / IMAGENET_STD
 
     # HWC -> CHW -> NCHW
@@ -74,37 +97,79 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
     return np.ascontiguousarray(array, dtype=np.float32)
 
 
+# ============================================================
+# EMBEDDING VALIDATION
+# ============================================================
+
+
 def normalize_embedding(embedding: np.ndarray) -> np.ndarray:
-    """Validate and L2-normalize one embedding."""
-    embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    """
+    Validate and L2-normalize an embedding.
+    """
+    embedding = np.asarray(
+        embedding,
+        dtype=np.float32,
+    ).reshape(-1)
 
     if embedding.size != EMBEDDING_DIM:
         raise ValueError(
-            f"Expected {EMBEDDING_DIM}-D embedding, " f"received {embedding.size}-D."
+            f"Expected {EMBEDDING_DIM}-dimensional embedding; "
+            f"received {embedding.size}."
         )
 
     if not np.all(np.isfinite(embedding)):
-        raise ValueError("The model produced an invalid embedding.")
+        raise ValueError("Embedding contains invalid numeric values.")
 
     norm = float(np.linalg.norm(embedding))
 
     if norm <= 1e-12:
-        raise ValueError("The model produced a zero-length embedding.")
+        raise ValueError("Embedding has zero magnitude.")
 
-    return embedding / norm
+    embedding /= norm
+
+    return embedding
+
+
+# ============================================================
+# ONNX JEWELLERY MATCHER
+# ============================================================
 
 
 class ONNXJewelleryMatcher:
-    """Segmented DINOv2 ONNX image matcher backed by MongoDB."""
+    """
+    Segmented DINOv2 ONNX matcher.
+
+    Prototype query -> gold catalogue
+    Gold query      -> prototype catalogue
+
+    Model inference uses ONNX Runtime on CPU.
+    No PyTorch or TorchVision is required.
+    """
 
     def __init__(self):
+
         if not MODEL_PATH.is_file():
-            raise FileNotFoundError("Model 2 ONNX file was not found: " f"{MODEL_PATH}")
+            raise FileNotFoundError(f"Model 2 ONNX file not found: {MODEL_PATH}")
+
+        # ----------------------------------------------------
+        # LOW-MEMORY ONNX SESSION
+        # ----------------------------------------------------
 
         options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-        # Render CPU deployment: no CUDA or PyTorch dependency.
+        # Avoid additional graph-optimization memory overhead.
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+
+        # Use sequential execution with one thread.
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+
+        # Reduce runtime memory overhead.
+        options.enable_mem_pattern = False
+        options.enable_cpu_mem_arena = False
+
         self.session = ort.InferenceSession(
             str(MODEL_PATH),
             sess_options=options,
@@ -115,60 +180,98 @@ class ONNXJewelleryMatcher:
         outputs = self.session.get_outputs()
 
         if not inputs or not outputs:
-            raise RuntimeError("The ONNX model has no input or output.")
+            raise RuntimeError("ONNX model has no input or output.")
 
         self.input_name = inputs[0].name
         self.output_name = outputs[0].name
 
+        # Lock inference to avoid concurrent inference spikes.
         self.inference_lock = threading.Lock()
+
+        # Protect catalogue cache operations.
         self.cache_lock = threading.Lock()
-        self.catalogue_cache = {}
+
+        # Only one catalogue's vectors are retained at a time.
+        self.cached_collection_name = None
+        self.cached_matrix = None
+        self.cached_records = None
 
         print("[MODEL 2] ONNX model loaded:", MODEL_PATH.name)
+        print("[MODEL 2] Model ID:", MODEL_ID)
         print("[MODEL 2] Input:", self.input_name)
         print("[MODEL 2] Output:", self.output_name)
-        print("[MODEL 2] Provider:", self.session.get_providers())
-        print("[MODEL 2] Model ID:", MODEL_ID)
+        print(
+            "[MODEL 2] Providers:",
+            self.session.get_providers(),
+        )
+
+    # ========================================================
+    # EMBED ONE IMAGE
+    # ========================================================
 
     def _embed_image(self, image: Image.Image) -> np.ndarray:
-        """Segment and embed one image using the ONNX model."""
+        """
+        Segment and embed a single jewellery image.
+        """
         if not isinstance(image, Image.Image):
             raise TypeError("Expected a PIL Image.")
 
+        # Use the existing GrabCut segmentation.
         segmented_image = prepare_ring_image(image)
+
         input_tensor = preprocess_image(segmented_image)
 
         with self.inference_lock:
-            result = self.session.run(
+            outputs = self.session.run(
                 [self.output_name],
-                {self.input_name: input_tensor},
+                {
+                    self.input_name: input_tensor,
+                },
             )
 
-        if not result:
-            raise RuntimeError("The ONNX model returned no output.")
+        del input_tensor
 
-        return normalize_embedding(result[0])
+        if not outputs:
+            raise RuntimeError("ONNX model returned no output.")
+
+        embedding = normalize_embedding(outputs[0])
+
+        del outputs
+
+        return embedding
+
+    # ========================================================
+    # LOAD MONGODB CATALOGUE EMBEDDINGS
+    # ========================================================
 
     def _get_catalogue_embeddings(self, collection_name: str):
         """
-        Retrieve cached Model 2 embeddings from a MongoDB collection.
+        Load the selected catalogue's Model 2 embeddings.
 
-        Documents must contain:
+        Expected MongoDB fields:
           experimental_embedding
           experimental_embedding_model
+
+        The other Model 1 fields are not modified.
         """
         if collection_name not in ("gold", "prototype"):
             raise ValueError("Collection must be 'gold' or 'prototype'.")
 
+        # Return cached data when the requested collection matches.
         with self.cache_lock:
-            if collection_name in self.catalogue_cache:
-                return self.catalogue_cache[collection_name]
+            if self.cached_collection_name == collection_name:
+                return (
+                    self.cached_matrix,
+                    self.cached_records,
+                )
 
         collection = get_catalogue_collection(collection_name)
 
         query = {
             "experimental_embedding_model": MODEL_ID,
-            "experimental_embedding": {"$exists": True},
+            "experimental_embedding": {
+                "$exists": True,
+            },
         }
 
         projection = {
@@ -178,64 +281,100 @@ class ONNXJewelleryMatcher:
             "image_gridfs_id": 1,
             "image_url": 1,
             "experimental_embedding": 1,
-            "experimental_embedding_model": 1,
         }
 
         vectors = []
         records = []
 
-        for document in collection.find(query, projection):
-            try:
-                vector = normalize_embedding(
-                    np.asarray(
-                        document["experimental_embedding"],
-                        dtype=np.float32,
-                    )
+        cursor = collection.find(
+            query,
+            projection,
+        ).batch_size(100)
+
+        try:
+            for document in cursor:
+
+                try:
+                    vector = normalize_embedding(document["experimental_embedding"])
+
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                ):
+                    continue
+
+                vectors.append(vector)
+
+                gridfs_id = document.get("image_gridfs_id")
+
+                records.append(
+                    {
+                        "id": str(document["_id"]),
+                        "name": (
+                            document.get("name")
+                            or document.get("product_name")
+                            or str(document["_id"])
+                        ),
+                        "image_gridfs_id": (
+                            str(gridfs_id) if gridfs_id is not None else None
+                        ),
+                        "image_url": document.get("image_url"),
+                    }
                 )
-            except (KeyError, TypeError, ValueError):
-                continue
 
-            vectors.append(vector)
+        finally:
+            cursor.close()
 
-            records.append(
-                {
-                    "id": str(document["_id"]),
-                    "name": (
-                        document.get("name")
-                        or document.get("product_name")
-                        or str(document["_id"])
-                    ),
-                    "image_gridfs_id": (
-                        str(document["image_gridfs_id"])
-                        if document.get("image_gridfs_id") is not None
-                        else None
-                    ),
-                    "image_url": document.get("image_url"),
-                }
+        if vectors:
+            matrix = np.vstack(vectors).astype(
+                np.float32,
+                copy=False,
+            )
+        else:
+            matrix = np.empty(
+                (0, EMBEDDING_DIM),
+                dtype=np.float32,
             )
 
-        matrix = (
-            np.vstack(vectors).astype(np.float32)
-            if vectors
-            else np.empty((0, EMBEDDING_DIM), dtype=np.float32)
-        )
+        del vectors
+        gc.collect()
 
-        data = (matrix, records)
-
+        # Cache only one collection to reduce retained memory.
         with self.cache_lock:
-            self.catalogue_cache[collection_name] = data
+
+            self.cached_collection_name = collection_name
+            self.cached_matrix = matrix
+            self.cached_records = records
 
         print(
-            f"[MODEL 2] Loaded {len(records)} embeddings "
-            f"from MongoDB collection '{collection_name}'."
+            f"[MODEL 2] Loaded {len(records)} embeddings " f"from '{collection_name}'."
         )
 
-        return data
+        return matrix, records
+
+    # ========================================================
+    # CLEAR CATALOGUE CACHE
+    # ========================================================
 
     def clear_catalogue_cache(self):
-        """Clear cached vectors after regenerating MongoDB embeddings."""
+        """
+        Release cached catalogue vectors.
+
+        The ONNX session remains loaded.
+        """
         with self.cache_lock:
-            self.catalogue_cache.clear()
+            self.cached_collection_name = None
+            self.cached_matrix = None
+            self.cached_records = None
+
+        gc.collect()
+
+        print("[MODEL 2] Catalogue cache cleared.")
+
+    # ========================================================
+    # FIND MATCHES
+    # ========================================================
 
     def find_matches(
         self,
@@ -244,15 +383,18 @@ class ONNXJewelleryMatcher:
         top_k: int = 5,
     ) -> list:
         """
-        Match prototype -> gold or gold -> prototype.
+        Find visually similar jewellery.
 
-        source='prototype' searches the gold collection.
-        source='gold' searches the prototype collection.
+        source='prototype':
+            Search the gold collection.
+
+        source='gold':
+            Search the prototype collection.
         """
         source = (source or "prototype").strip().lower()
 
         if source not in ("gold", "prototype"):
-            raise ValueError("source must be either 'gold' or 'prototype'.")
+            raise ValueError("source must be 'gold' or 'prototype'.")
 
         target_collection = "prototype" if source == "gold" else "gold"
 
@@ -261,26 +403,41 @@ class ONNXJewelleryMatcher:
         except (TypeError, ValueError):
             top_k = 5
 
-        top_k = max(1, min(top_k, 50))
+        top_k = max(
+            1,
+            min(top_k, 50),
+        )
 
+        # Embed uploaded query image.
         query_embedding = self._embed_image(image)
 
-        catalogue_matrix, records = self._get_catalogue_embeddings(target_collection)
+        # Load the target collection's stored embeddings.
+        matrix, records = self._get_catalogue_embeddings(target_collection)
 
-        if catalogue_matrix.shape[0] == 0:
+        if matrix.shape[0] == 0:
             return []
 
-        # All vectors are L2-normalized, so dot product equals cosine similarity.
-        scores = catalogue_matrix @ query_embedding
+        # Normalized vectors: dot product equals cosine similarity.
+        scores = matrix @ query_embedding
 
-        count = min(top_k, len(scores))
-        best_indices = np.argsort(scores)[::-1][:count]
+        result_count = min(
+            top_k,
+            len(scores),
+        )
+
+        best_indices = np.argsort(scores)[::-1][:result_count]
 
         matches = []
 
         for index in best_indices:
+
             record = records[int(index)].copy()
-            record["score"] = float(scores[index])
+
+            record["score"] = float(scores[int(index)])
+
             matches.append(record)
+
+        del query_embedding
+        del scores
 
         return matches
