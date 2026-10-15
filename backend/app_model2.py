@@ -1,174 +1,263 @@
-import gc
-import os
-from pathlib import Path
+from io import BytesIO
 
 from bson import ObjectId
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from gridfs import GridFS
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
-from .database.mongodb import get_database, test_mongodb_connection
-from .onnx_matcher import ONNXJewelleryMatcher
+from .database.mongodb import (
+    get_database,
+    test_mongodb_connection,
+)
+from .onnx_matcher import ONNXJewelleryMatcher, MODEL_ID
 
 app = Flask(__name__)
 CORS(app)
+
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
+# This service loads only the Model 2 ONNX model.
 matcher = ONNXJewelleryMatcher()
 
 
-@app.route("/api/health", methods=["GET"])
+@app.errorhandler(413)
+def request_too_large(_error):
+    return (
+        jsonify(
+            {
+                "status": "error",
+                "message": "Image is too large. Maximum upload size is 10 MB.",
+            }
+        ),
+        413,
+    )
+
+
+@app.get("/")
+def index():
+    return jsonify(
+        {
+            "service": "JewelMatchAI Model 2",
+            "model": "Segmented DINOv2 ONNX",
+            "model_id": MODEL_ID,
+            "status": "running",
+        }
+    )
+
+
+@app.get("/api/health")
 def health():
     try:
-        test_mongodb_connection()
-        return jsonify(
-            {
-                "status": "ok",
-                "model": "segmented_dinov2_onnx",
-                "model_id": matcher.__class__.__name__,
-            }
+        database_ok = bool(test_mongodb_connection())
+    except Exception as exc:
+        app.logger.exception("MongoDB health check failed")
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "model": "segmented_dinov2_onnx",
+                    "model_id": MODEL_ID,
+                    "mongodb": "unavailable",
+                    "message": str(exc),
+                }
+            ),
+            503,
         )
-    except Exception:
-        app.logger.exception("Health check failed.")
-        return jsonify({"status": "error"}), 503
+
+    if not database_ok:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "model": "segmented_dinov2_onnx",
+                    "model_id": MODEL_ID,
+                    "mongodb": "unavailable",
+                }
+            ),
+            503,
+        )
+
+    return jsonify(
+        {
+            "status": "ok",
+            "model": "segmented_dinov2_onnx",
+            "model_id": MODEL_ID,
+            "mongodb": "connected",
+            "provider": "CPUExecutionProvider",
+        }
+    )
 
 
-@app.route("/api/match/experimental", methods=["POST"])
+@app.route(
+    "/api/match/experimental",
+    methods=["POST"],
+)
 @app.route("/api/match", methods=["POST"])
-def match():
-    image = None
-    uploaded = None
+def match_jewellery():
+    """
+    Multipart/form-data:
+      image: uploaded jewellery image
+      source: 'gold' or 'prototype'
+      top_k: optional number of matches
+    """
+    if "image" not in request.files:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Upload an image using the 'image' field.",
+                }
+            ),
+            400,
+        )
+
+    uploaded_file = request.files["image"]
+
+    if not uploaded_file.filename:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "No image file was selected.",
+                }
+            ),
+            400,
+        )
+
+    source = request.form.get("source", "prototype").strip().lower()
+    top_k = request.form.get("top_k", 5)
+
+    if source not in ("gold", "prototype"):
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "source must be 'gold' or 'prototype'.",
+                }
+            ),
+            400,
+        )
 
     try:
-        uploaded = request.files.get("image")
+        with Image.open(uploaded_file.stream) as opened_image:
+            image = opened_image.convert("RGB")
 
-        if uploaded is None or not uploaded.filename:
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": "Please upload an image.",
-                    }
-                ),
-                400,
-            )
-
-        source = request.form.get("source", "prototype").lower().strip()
-
-        if source not in {"gold", "prototype"}:
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": "Source must be 'gold' or 'prototype'.",
-                    }
-                ),
-                400,
-            )
-
-        try:
-            top_k = int(request.form.get("top_k", 5))
-        except (TypeError, ValueError):
-            top_k = 5
-
-        with Image.open(uploaded.stream) as original:
-            image = original.convert("RGB")
-
-        results = matcher.find_matches(
+        matches = matcher.find_matches(
             image=image,
             source=source,
             top_k=top_k,
         )
 
-        target = "prototype" if source == "gold" else "gold"
-
         return jsonify(
             {
-                "success": True,
-                "source": source,
-                "target": target,
+                "status": "success",
                 "model_type": "segmented_dinov2_onnx",
-                "results": results,
+                "model_id": MODEL_ID,
+                "source": source,
+                "target": "prototype" if source == "gold" else "gold",
+                "count": len(matches),
+                "matches": matches,
             }
+        )
+
+    except UnidentifiedImageError:
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "The uploaded file is not a valid image.",
+                }
+            ),
+            400,
         )
 
     except ValueError as exc:
         return (
             jsonify(
                 {
-                    "success": False,
-                    "error": str(exc),
+                    "status": "error",
+                    "message": str(exc),
                 }
             ),
             400,
         )
 
-    except Exception:
-        app.logger.exception("Model 2 matching failed.")
+    except Exception as exc:
+        app.logger.exception("Model 2 matching failed")
         return (
             jsonify(
                 {
-                    "success": False,
-                    "error": "Model 2 matching failed.",
+                    "status": "error",
+                    "message": "Matching failed. Check the service logs.",
                 }
             ),
             500,
         )
 
-    finally:
-        if image is not None:
-            image.close()
 
-        if uploaded is not None:
-            uploaded.close()
-
-        gc.collect()
-
-
-@app.route("/catalogue-image/stored/<gridfs_id>", methods=["GET"])
-def catalogue_image_stored(gridfs_id):
+@app.get("/catalogue-image/stored/<gridfs_id>")
+def stored_catalogue_image(gridfs_id):
+    """Serve an image stored in MongoDB GridFS."""
     try:
         object_id = ObjectId(gridfs_id)
-        gridfs = GridFS(get_database())
+        database = get_database()
+        gridfs = GridFS(database)
 
-        if not gridfs.exists(object_id):
+        if not gridfs.exists(object_id=object_id):
             return (
                 jsonify(
                     {
-                        "success": False,
-                        "error": "Stored image not found.",
+                        "status": "error",
+                        "message": "Catalogue image not found.",
                     }
                 ),
                 404,
             )
 
-        grid_file = gridfs.get(object_id)
+        stored_file = gridfs.get(object_id)
+        image_bytes = stored_file.read()
 
         return send_file(
-            grid_file,
-            mimetype=(
-                getattr(grid_file, "content_type", None) or "application/octet-stream"
-            ),
-            download_name=(getattr(grid_file, "filename", None) or "jewellery-image"),
+            BytesIO(image_bytes),
+            mimetype=stored_file.content_type or "image/jpeg",
+            download_name=stored_file.filename or "catalogue-image.jpg",
+            max_age=3600,
         )
 
     except Exception:
-        app.logger.exception("GridFS retrieval failed.")
+        app.logger.exception("Could not retrieve GridFS image")
         return (
             jsonify(
                 {
-                    "success": False,
-                    "error": "Could not retrieve the stored image.",
+                    "status": "error",
+                    "message": "Could not retrieve the catalogue image.",
                 }
             ),
             500,
         )
 
 
+@app.post("/api/model2/cache/clear")
+def clear_model2_cache():
+    """
+    Clear cached MongoDB embeddings after regenerating Model 2 vectors.
+
+    Protect this endpoint before exposing it publicly if you use it.
+    """
+    matcher.clear_catalogue_cache()
+
+    return jsonify(
+        {
+            "status": "success",
+            "message": "Model 2 catalogue embedding cache cleared.",
+        }
+    )
+
+
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
+        port=5000,
         debug=False,
     )
