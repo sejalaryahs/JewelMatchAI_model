@@ -12,17 +12,33 @@ from .database.mongodb import (
 )
 from .onnx_matcher import ONNXJewelleryMatcher, MODEL_ID
 
+# ============================================================
+# FLASK APPLICATION
+# ============================================================
+
 app = Flask(__name__)
+
 CORS(app)
 
+# Maximum uploaded image size: 10 MB
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
-# This service loads only the Model 2 ONNX model.
+# Load Model 2 ONNX matcher once when the worker starts.
 matcher = ONNXJewelleryMatcher()
+
+app.logger.info("[MODEL 2] Flask application initialized")
+app.logger.info("[MODEL 2] Model ID: %s", MODEL_ID)
+
+
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
 
 
 @app.errorhandler(413)
 def request_too_large(_error):
+    app.logger.warning("[MODEL 2] Upload rejected: file exceeds 10 MB")
+
     return (
         jsonify(
             {
@@ -32,6 +48,39 @@ def request_too_large(_error):
         ),
         413,
     )
+
+
+@app.errorhandler(404)
+def not_found(_error):
+    return (
+        jsonify(
+            {
+                "status": "error",
+                "message": "The requested endpoint was not found.",
+            }
+        ),
+        404,
+    )
+
+
+@app.errorhandler(500)
+def internal_server_error(_error):
+    app.logger.exception("[MODEL 2] Unhandled application error")
+
+    return (
+        jsonify(
+            {
+                "status": "error",
+                "message": "Internal server error. Check the service logs.",
+            }
+        ),
+        500,
+    )
+
+
+# ============================================================
+# ROOT
+# ============================================================
 
 
 @app.get("/")
@@ -46,12 +95,19 @@ def index():
     )
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+
 @app.get("/api/health")
 def health():
     try:
         database_ok = bool(test_mongodb_connection())
-    except Exception as exc:
-        app.logger.exception("MongoDB health check failed")
+
+    except Exception:
+        app.logger.exception("[MODEL 2 HEALTH] MongoDB health check failed")
+
         return (
             jsonify(
                 {
@@ -59,7 +115,6 @@ def health():
                     "model": "segmented_dinov2_onnx",
                     "model_id": MODEL_ID,
                     "mongodb": "unavailable",
-                    "message": str(exc),
                 }
             ),
             503,
@@ -89,19 +144,41 @@ def health():
     )
 
 
-@app.route(
-    "/api/match/experimental",
-    methods=["POST"],
-)
+# ============================================================
+# JEWELLERY MATCHING
+# ============================================================
+
+
+@app.route("/api/match/experimental", methods=["POST"])
 @app.route("/api/match", methods=["POST"])
 def match_jewellery():
     """
-    Multipart/form-data:
-      image: uploaded jewellery image
-      source: 'gold' or 'prototype'
-      top_k: optional number of matches
+    Multipart/form-data fields:
+
+        image:  Uploaded jewellery image (required)
+        source: gold or prototype (optional)
+        top_k:  Number of results (optional)
+
+    source='gold':
+        Search prototype catalogue.
+
+    source='prototype':
+        Search gold catalogue.
     """
+
+    app.logger.info("[MODEL 2 POST] Request received")
+    app.logger.info(
+        "[MODEL 2 POST] Content length: %s",
+        request.content_length,
+    )
+
+    # --------------------------------------------------------
+    # VALIDATE UPLOADED FILE
+    # --------------------------------------------------------
+
     if "image" not in request.files:
+        app.logger.warning("[MODEL 2 POST] Missing image field")
+
         return (
             jsonify(
                 {
@@ -115,6 +192,8 @@ def match_jewellery():
     uploaded_file = request.files["image"]
 
     if not uploaded_file.filename:
+        app.logger.warning("[MODEL 2 POST] Empty image filename")
+
         return (
             jsonify(
                 {
@@ -125,10 +204,23 @@ def match_jewellery():
             400,
         )
 
-    source = request.form.get("source", "prototype").strip().lower()
+    source = (
+        request.form.get(
+            "source",
+            "prototype",
+        )
+        .strip()
+        .lower()
+    )
+
     top_k = request.form.get("top_k", 5)
 
     if source not in ("gold", "prototype"):
+        app.logger.warning(
+            "[MODEL 2 POST] Invalid source: %s",
+            source,
+        )
+
         return (
             jsonify(
                 {
@@ -139,9 +231,29 @@ def match_jewellery():
             400,
         )
 
+    # --------------------------------------------------------
+    # OPEN IMAGE AND RUN MATCHING
+    # --------------------------------------------------------
+
     try:
+        app.logger.info(
+            "[MODEL 2 POST] Image received: %s",
+            uploaded_file.filename,
+        )
+
         with Image.open(uploaded_file.stream) as opened_image:
             image = opened_image.convert("RGB")
+
+        app.logger.info(
+            "[MODEL 2 POST] Image opened successfully: size=%s",
+            image.size,
+        )
+
+        app.logger.info(
+            "[MODEL 2 POST] Starting matching: source=%s, top_k=%s",
+            source,
+            top_k,
+        )
 
         matches = matcher.find_matches(
             image=image,
@@ -149,19 +261,44 @@ def match_jewellery():
             top_k=top_k,
         )
 
-        return jsonify(
-            {
-                "status": "success",
-                "model_type": "segmented_dinov2_onnx",
-                "model_id": MODEL_ID,
-                "source": source,
-                "target": "prototype" if source == "gold" else "gold",
-                "count": len(matches),
-                "matches": matches,
+        target = "prototype" if source == "gold" else "gold"
+
+        app.logger.info(
+            "[MODEL 2 POST] Matching completed: source=%s, " "target=%s, results=%s",
+            source,
+            target,
+            len(matches),
+        )
+
+        # Do not expose internal similarity scores to the frontend.
+        public_matches = []
+
+        for match in matches:
+            public_match = {
+                key: value for key, value in match.items() if key != "score"
             }
+            public_matches.append(public_match)
+
+        return (
+            jsonify(
+                {
+                    "status": "success",
+                    "model_type": "segmented_dinov2_onnx",
+                    "model_id": MODEL_ID,
+                    "source": source,
+                    "target": target,
+                    "count": len(public_matches),
+                    "matches": public_matches,
+                }
+            ),
+            200,
         )
 
     except UnidentifiedImageError:
+        app.logger.warning(
+            "[MODEL 2 POST] Uploaded file is not a valid image",
+        )
+
         return (
             jsonify(
                 {
@@ -173,6 +310,8 @@ def match_jewellery():
         )
 
     except ValueError as exc:
+        app.logger.exception("[MODEL 2 POST] Validation or matching ValueError")
+
         return (
             jsonify(
                 {
@@ -183,8 +322,9 @@ def match_jewellery():
             400,
         )
 
-    except Exception as exc:
-        app.logger.exception("Model 2 matching failed")
+    except Exception:
+        app.logger.exception("[MODEL 2 POST] Matching failed")
+
         return (
             jsonify(
                 {
@@ -196,11 +336,18 @@ def match_jewellery():
         )
 
 
+# ============================================================
+# SERVE CATALOGUE IMAGES FROM GRIDFS
+# ============================================================
+
+
 @app.get("/catalogue-image/stored/<gridfs_id>")
 def stored_catalogue_image(gridfs_id):
-    """Serve an image stored in MongoDB GridFS."""
+    """Serve a catalogue image stored in MongoDB GridFS."""
+
     try:
         object_id = ObjectId(gridfs_id)
+
         database = get_database()
         gridfs = GridFS(database)
 
@@ -226,7 +373,10 @@ def stored_catalogue_image(gridfs_id):
         )
 
     except Exception:
-        app.logger.exception("Could not retrieve GridFS image")
+        app.logger.exception(
+            "[MODEL 2 IMAGE] Could not retrieve GridFS image",
+        )
+
         return (
             jsonify(
                 {
@@ -238,22 +388,48 @@ def stored_catalogue_image(gridfs_id):
         )
 
 
+# ============================================================
+# CLEAR MODEL 2 EMBEDDING CACHE
+# ============================================================
+
+
 @app.post("/api/model2/cache/clear")
 def clear_model2_cache():
     """
-    Clear cached MongoDB embeddings after regenerating Model 2 vectors.
+    Clear cached catalogue embeddings after updating them.
 
-    Protect this endpoint before exposing it publicly if you use it.
+    Protect this endpoint before exposing it publicly.
     """
-    matcher.clear_catalogue_cache()
 
-    return jsonify(
-        {
-            "status": "success",
-            "message": "Model 2 catalogue embedding cache cleared.",
-        }
-    )
+    try:
+        matcher.clear_catalogue_cache()
 
+        app.logger.info("[MODEL 2] Catalogue cache cleared")
+
+        return jsonify(
+            {
+                "status": "success",
+                "message": "Model 2 catalogue embedding cache cleared.",
+            }
+        )
+
+    except Exception:
+        app.logger.exception("[MODEL 2] Cache clearing failed")
+
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Could not clear the Model 2 cache.",
+                }
+            ),
+            500,
+        )
+
+
+# ============================================================
+# LOCAL DEVELOPMENT
+# ============================================================
 
 if __name__ == "__main__":
     app.run(
