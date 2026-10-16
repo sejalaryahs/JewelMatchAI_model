@@ -797,7 +797,7 @@ from .database.mongodb import (
     get_database,
     test_mongodb_connection,
 )
-from .onnx_matcher import ONNXJewelleryMatcher, MODEL_ID
+from backend.onnx_matcher import ONNXJewelleryMatcher, MODEL_ID
 
 # ============================================================
 # FLASK APPLICATION
