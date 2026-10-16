@@ -1,14 +1,16 @@
 """
 Model 2: Segmented DINOv2 ONNX Jewellery Matcher.
 
-Designed for low-memory Render deployments:
+Low-memory deployment features:
 - Lazy ONNX session initialization
-- Single-threaded CPU inference
-- Reduced ONNX Runtime memory retention
-- MongoDB-stored, precomputed catalogue embeddings
+- One reusable CPU inference session
+- Single-threaded, serialized inference
+- One target-catalogue embedding cache
+- Float32 normalized catalogue embeddings
+- MongoDB-stored precomputed embeddings
 - Gold -> Prototype and Prototype -> Gold matching
 
-This file does not modify Model 1.
+Model 1 is not modified.
 """
 
 import gc
@@ -35,18 +37,24 @@ MODEL_PATH = os.path.join(
 IMAGE_SIZE = 224
 EMBEDDING_DIM = 512
 
-# ImageNet normalization used by the DINOv2 preprocessing pipeline.
-IMAGE_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+IMAGE_MEAN = np.asarray(
+    [0.485, 0.456, 0.406],
+    dtype=np.float32,
+).reshape(1, 1, 3)
 
-IMAGE_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+IMAGE_STD = np.asarray(
+    [0.229, 0.224, 0.225],
+    dtype=np.float32,
+).reshape(1, 1, 3)
 
 
 class ONNXJewelleryMatcher:
-    """Low-memory ONNX jewellery matcher for Model 2."""
+    """Memory-conscious ONNX matcher for Model 2."""
 
     def __init__(self, model_path=None):
-        # Do not initialize ONNX here. This keeps application startup light.
+        # Keep application startup light: load ONNX only on first inference.
         self.model_path = model_path or MODEL_PATH
+
         self.session = None
         self.input_name = None
         self.output_name = None
@@ -54,17 +62,22 @@ class ONNXJewelleryMatcher:
         self.input_width = IMAGE_SIZE
 
         self._session_lock = threading.Lock()
+        self._inference_lock = threading.Lock()
         self._catalogue_lock = threading.Lock()
 
-        # Cache one target catalogue at a time to limit retained memory.
+        # Keep only one target catalogue cached at a time.
         self._catalogue_cache_source = None
         self._catalogue_cache_embeddings = None
         self._catalogue_cache_documents = None
 
-        logger.info("[MODEL 2] Matcher created; ONNX loading is deferred.")
+        logger.info("[MODEL 2] Matcher created. ONNX loading is deferred.")
+
+    # --------------------------------------------------------
+    # ONNX SESSION
+    # --------------------------------------------------------
 
     def _ensure_session(self):
-        """Create the ONNX session only when inference is first required."""
+        """Create and reuse a single ONNX Runtime session."""
         if self.session is not None:
             return self.session
 
@@ -74,7 +87,7 @@ class ONNXJewelleryMatcher:
 
             if not os.path.isfile(self.model_path):
                 raise FileNotFoundError(
-                    "Model 2 ONNX model was not found: " f"{self.model_path}"
+                    f"Model 2 ONNX model was not found: {self.model_path}"
                 )
 
             options = ort.SessionOptions()
@@ -82,12 +95,12 @@ class ONNXJewelleryMatcher:
             options.intra_op_num_threads = 1
             options.inter_op_num_threads = 1
 
-            # Reduce memory retention on small Render instances.
+            # Reduce optional memory retention on small instances.
             options.enable_cpu_mem_arena = False
             options.enable_mem_pattern = False
             options.log_severity_level = 3
 
-            logger.info("[MODEL 2] Loading ONNX model on demand.")
+            logger.info("[MODEL 2] Initializing ONNX Runtime session.")
 
             session = ort.InferenceSession(
                 self.model_path,
@@ -101,58 +114,69 @@ class ONNXJewelleryMatcher:
             if not model_inputs or not model_outputs:
                 raise RuntimeError("The ONNX model has no usable inputs or outputs.")
 
-            self.input_name = model_inputs[0].name
-            self.output_name = model_outputs[0].name
+            input_meta = model_inputs[0]
+            output_meta = model_outputs[0]
 
-            # Respect the model's declared input dimensions when available.
-            input_shape = model_inputs[0].shape
-            if len(input_shape) != 4:
+            if len(input_meta.shape) != 4:
                 raise RuntimeError(
-                    "Expected an ONNX image input with four dimensions "
-                    "[batch, channels, height, width]; got "
-                    f"{input_shape!r}"
+                    "Expected ONNX input shape [batch, channels, height, width]; "
+                    f"received {input_meta.shape!r}."
                 )
 
-            height = input_shape[2]
-            width = input_shape[3]
+            # Confirm this is a three-channel image model.
+            channels = input_meta.shape[1]
+            if isinstance(channels, int) and channels != 3:
+                raise RuntimeError(f"Expected 3 input channels, received {channels}.")
+
+            height = input_meta.shape[2]
+            width = input_meta.shape[3]
 
             if isinstance(height, int) and height > 0:
                 self.input_height = height
+
             if isinstance(width, int) and width > 0:
                 self.input_width = width
 
+            self.input_name = input_meta.name
+            self.output_name = output_meta.name
             self.session = session
 
             logger.info(
-                "[MODEL 2] ONNX session ready; input=%s, size=%sx%s, " "provider=%s",
+                "[MODEL 2] ONNX session ready: input=%s, output=%s, "
+                "size=%sx%s, providers=%s",
                 self.input_name,
+                self.output_name,
                 self.input_width,
                 self.input_height,
-                session.get_providers()[0],
+                session.get_providers(),
             )
 
             return self.session
 
+    # --------------------------------------------------------
+    # IMAGE READING
+    # --------------------------------------------------------
+
     @staticmethod
     def _read_image(image):
-        """Convert an uploaded image or image path to an RGB PIL image."""
+        """Read an uploaded image, bytes, PIL image, file or path."""
         if isinstance(image, Image.Image):
             return ImageOps.exif_transpose(image).convert("RGB")
 
-        if isinstance(image, (bytes, bytearray)):
-            return ImageOps.exif_transpose(Image.open(io.BytesIO(image))).convert("RGB")
+        if isinstance(image, (bytes, bytearray, memoryview)):
+            with Image.open(io.BytesIO(image)) as opened:
+                return ImageOps.exif_transpose(opened).convert("RGB")
 
         if hasattr(image, "read"):
-            # Support Flask FileStorage and other file-like objects.
             content = image.read()
+
             try:
                 image.seek(0)
             except (AttributeError, OSError):
                 pass
 
-            return ImageOps.exif_transpose(Image.open(io.BytesIO(content))).convert(
-                "RGB"
-            )
+            with Image.open(io.BytesIO(content)) as opened:
+                return ImageOps.exif_transpose(opened).convert("RGB")
 
         if isinstance(image, (str, os.PathLike)):
             with Image.open(image) as opened:
@@ -163,73 +187,122 @@ class ONNXJewelleryMatcher:
             "file-like object, or filesystem path."
         )
 
+    # --------------------------------------------------------
+    # PREPROCESSING
+    # --------------------------------------------------------
+
     def _preprocess_image(self, image):
         """
-        Prepare an image for the ONNX model.
+        Prepare an image as float32 NCHW input.
 
-        Uses RGB resizing, ImageNet normalization, and NCHW layout.
-        If your exported ONNX model was trained with a different
-        preprocessing pipeline, this function must match that pipeline.
+        IMPORTANT:
+        This matches the current matcher's direct resize and ImageNet
+        normalization. It does not perform runtime segmentation or a
+        center crop. Change this only if the model's training and
+        catalogue-embedding pipeline require different preprocessing.
         """
         pil_image = self._read_image(image)
 
-        pil_image = pil_image.resize(
-            (self.input_width, self.input_height),
-            Image.Resampling.BICUBIC,
-        )
+        try:
+            resized = pil_image.resize(
+                (self.input_width, self.input_height),
+                Image.Resampling.BICUBIC,
+            )
 
-        array = np.asarray(pil_image, dtype=np.float32) / 255.0
-        array = (array - IMAGE_MEAN) / IMAGE_STD
+            array = np.asarray(resized, dtype=np.float32)
+            array *= np.float32(1.0 / 255.0)
 
-        # HWC -> CHW -> NCHW
-        tensor = np.transpose(array, (2, 0, 1))[None, ...]
-        tensor = np.ascontiguousarray(tensor, dtype=np.float32)
+            array -= IMAGE_MEAN
+            array /= IMAGE_STD
 
-        return tensor
+            # HWC -> CHW -> NCHW
+            tensor = np.transpose(array, (2, 0, 1))[None, ...]
+            tensor = np.ascontiguousarray(tensor, dtype=np.float32)
+
+            del array
+            return tensor
+
+        finally:
+            pil_image.close()
+
+    # --------------------------------------------------------
+    # EMBEDDING NORMALIZATION
+    # --------------------------------------------------------
 
     @staticmethod
     def _normalize_embedding(embedding):
-        """Flatten and L2-normalize a model embedding."""
-        embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        """Validate and L2-normalize a 512-dimensional vector."""
+        vector = np.asarray(
+            embedding,
+            dtype=np.float32,
+        ).reshape(-1)
 
-        if embedding.size != EMBEDDING_DIM:
+        if vector.size != EMBEDDING_DIM:
             raise ValueError(
                 f"Expected a {EMBEDDING_DIM}-dimensional embedding, "
-                f"but received {embedding.size} dimensions."
+                f"received {vector.size} dimensions."
             )
 
-        norm = float(np.linalg.norm(embedding))
+        if not np.isfinite(vector).all():
+            raise ValueError("Embedding contains NaN or infinite values.")
+
+        norm = float(np.linalg.norm(vector))
+
         if not np.isfinite(norm) or norm <= 1e-12:
             raise ValueError("The model produced an invalid embedding.")
 
-        return embedding / norm
+        # Return a separate, normalized float32 vector.
+        return np.asarray(vector / norm, dtype=np.float32)
+
+    # --------------------------------------------------------
+    # QUERY EMBEDDING
+    # --------------------------------------------------------
 
     def _embed_image(self, image):
-        """Generate a normalized embedding using the lazy ONNX session."""
+        """Generate a query embedding using the reusable ONNX session."""
         session = self._ensure_session()
         tensor = self._preprocess_image(image)
 
-        outputs = session.run(
-            [self.output_name],
-            {self.input_name: tensor},
-        )
+        try:
+            # Serialize inference to avoid overlapping inference peaks
+            # when the server receives concurrent requests.
+            with self._inference_lock:
+                outputs = session.run(
+                    [self.output_name],
+                    {self.input_name: tensor},
+                )
 
-        if not outputs:
-            raise RuntimeError("The ONNX model returned no output.")
+            if not outputs:
+                raise RuntimeError("The ONNX model returned no output.")
 
-        embedding = self._normalize_embedding(outputs[0])
+            raw_embedding = outputs[0]
 
-        del outputs
-        del tensor
+            # The exported model should produce [batch, 512].
+            if raw_embedding.ndim != 2 or raw_embedding.shape[0] != 1:
+                raise RuntimeError(
+                    "Expected one ONNX embedding with shape [1, 512]; "
+                    f"received {raw_embedding.shape!r}."
+                )
 
-        return embedding
+            return self._normalize_embedding(raw_embedding[0])
+
+        finally:
+            del tensor
+            if "outputs" in locals():
+                del outputs
+            gc.collect()
+
+    # --------------------------------------------------------
+    # MONGODB COLLECTION
+    # --------------------------------------------------------
 
     @staticmethod
     def _get_collection(source):
-        """Resolve the existing Model 2 MongoDB catalogue collection."""
+        """Resolve the existing Model 2 catalogue collection."""
         from backend.database.mongodb import get_catalogue_collection
 
         collection = get_catalogue_collection(source)
+
         if collection is None:
             raise RuntimeError(
                 f"MongoDB catalogue collection '{source}' is unavailable."
@@ -237,15 +310,16 @@ class ONNXJewelleryMatcher:
 
         return collection
 
+    # --------------------------------------------------------
+    # CATALOGUE EMBEDDING CACHE
+    # --------------------------------------------------------
+
     def _get_catalogue_embeddings(self, source):
         """
-        Retrieve precomputed Model 2 embeddings from MongoDB.
+        Load compatible precomputed embeddings from MongoDB.
 
-        Catalogue documents must contain:
-          experimental_embedding_model
-          experimental_embedding
-
-        This method does not generate or write catalogue embeddings.
+        This function does not generate or modify catalogue embeddings.
+        Only one target catalogue is retained in the matcher cache.
         """
         source = str(source).strip().lower()
 
@@ -264,19 +338,21 @@ class ONNXJewelleryMatcher:
 
             collection = self._get_collection(source)
 
+            projection = {
+                "_id": 1,
+                "name": 1,
+                "category": 1,
+                "image_url": 1,
+                "image_gridfs_id": 1,
+                "experimental_embedding": 1,
+            }
+
             cursor = collection.find(
                 {
                     "experimental_embedding_model": MODEL_ID,
                     "experimental_embedding": {"$exists": True},
                 },
-                {
-                    "_id": 1,
-                    "name": 1,
-                    "category": 1,
-                    "image_url": 1,
-                    "image_gridfs_id": 1,
-                    "experimental_embedding": 1,
-                },
+                projection,
             )
 
             vectors = []
@@ -296,51 +372,69 @@ class ONNXJewelleryMatcher:
                         )
                         continue
 
+                    # Keep only fields required by the matching response.
+                    result_document = {
+                        "_id": document.get("_id"),
+                        "name": document.get("name"),
+                        "category": document.get("category"),
+                        "image_url": document.get("image_url"),
+                        "image_gridfs_id": document.get("image_gridfs_id"),
+                    }
+
                     vectors.append(vector)
-                    documents.append(document)
+                    documents.append(result_document)
+
             finally:
                 cursor.close()
 
             if not vectors:
                 logger.warning(
-                    "[MODEL 2] No compatible catalogue embeddings found "
-                    "in '%s' for model ID '%s'.",
+                    "[MODEL 2] No compatible embeddings found in '%s' "
+                    "for model ID '%s'.",
                     source,
                     MODEL_ID,
                 )
 
-                empty_embeddings = np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+                matrix = np.empty(
+                    (0, EMBEDDING_DIM),
+                    dtype=np.float32,
+                )
+                documents = []
 
-                self._catalogue_cache_source = source
-                self._catalogue_cache_embeddings = empty_embeddings
-                self._catalogue_cache_documents = []
+            else:
+                # Catalogue embeddings are small compared with the model,
+                # but avoid retaining both the vector list and matrix.
+                matrix = np.empty(
+                    (len(vectors), EMBEDDING_DIM),
+                    dtype=np.float32,
+                )
 
-                return empty_embeddings, []
+                for index, vector in enumerate(vectors):
+                    matrix[index] = vector
 
-            matrix = np.ascontiguousarray(
-                np.stack(vectors, axis=0),
-                dtype=np.float32,
-            )
+                del vectors
+                gc.collect()
 
-            # Replace the prior catalogue cache instead of retaining both.
+            # Replace the previous cached catalogue.
             self._catalogue_cache_source = source
             self._catalogue_cache_embeddings = matrix
             self._catalogue_cache_documents = documents
 
-            del vectors
-            gc.collect()
-
             logger.info(
-                "[MODEL 2] Loaded %s compatible embeddings from '%s'.",
+                "[MODEL 2] Cached %d compatible embeddings from '%s'.",
                 len(documents),
                 source,
             )
 
             return matrix, documents
 
+    # --------------------------------------------------------
+    # RESPONSE DOCUMENT
+    # --------------------------------------------------------
+
     @staticmethod
     def _document_to_result(document):
-        """Build a JSON-friendly match result without a similarity score."""
+        """Create a JSON-friendly match result."""
         result = {}
 
         for key in (
@@ -350,22 +444,32 @@ class ONNXJewelleryMatcher:
             "image_gridfs_id",
         ):
             value = document.get(key)
-            if value is not None:
-                result[key] = str(value) if key == "image_gridfs_id" else value
 
-        if "_id" in document:
+            if value is not None:
+                if key == "image_gridfs_id":
+                    result[key] = str(value)
+                else:
+                    result[key] = value
+
+        if document.get("_id") is not None:
             result["id"] = str(document["_id"])
 
         return result
 
+    # --------------------------------------------------------
+    # MATCHING
+    # --------------------------------------------------------
+
     def find_matches(self, image, source="prototype", top_k=5):
         """
-        Match an uploaded jewellery image against the opposite catalogue.
+        Match an uploaded image against the opposite catalogue.
 
         source='gold'      -> search prototype catalogue
         source='prototype' -> search gold catalogue
 
-        Similarity scores are kept internal and are not included in results.
+        Internal results retain 'score' for the existing API layer to
+        remove as needed. Similarity is not exposed by this class's
+        public result formatting.
         """
         source = str(source).strip().lower()
 
@@ -378,6 +482,7 @@ class ONNXJewelleryMatcher:
             top_k = 5
 
         top_k = max(1, min(top_k, 50))
+
         target = "prototype" if source == "gold" else "gold"
 
         query_embedding = self._embed_image(image)
@@ -385,29 +490,44 @@ class ONNXJewelleryMatcher:
         catalogue_embeddings, documents = self._get_catalogue_embeddings(target)
 
         if not documents or catalogue_embeddings.shape[0] == 0:
+            del query_embedding
             return []
 
-        # Both query and catalogue vectors are L2-normalized.
-        # Their dot product is cosine similarity.
-        similarities = catalogue_embeddings @ query_embedding
+        try:
+            # Query and catalogue vectors are normalized, so the dot
+            # product is cosine similarity.
+            similarities = catalogue_embeddings @ query_embedding
 
-        count = min(top_k, len(documents))
-        if count == len(documents):
-            indices = np.argsort(similarities)[::-1]
-        else:
-            indices = np.argpartition(similarities, -count)[-count:]
-            indices = indices[np.argsort(similarities[indices])[::-1]]
+            count = min(top_k, len(documents))
 
-        results = []
-        for index in indices:
-            result = self._document_to_result(documents[int(index)])
+            if count == len(documents):
+                indices = np.argsort(similarities)[::-1]
+            else:
+                indices = np.argpartition(
+                    similarities,
+                    -count,
+                )[-count:]
 
-            # Keep score internal so the existing API can strip it if needed.
-            result["score"] = float(similarities[int(index)])
-            results.append(result)
+                indices = indices[np.argsort(similarities[indices])[::-1]]
 
-        del similarities
-        del query_embedding
-        gc.collect()
+            results = []
 
-        return results
+            for index in indices:
+                result = self._document_to_result(documents[int(index)])
+
+                # Internal score is preserved for API compatibility.
+                result["score"] = float(similarities[int(index)])
+                results.append(result)
+
+            return results
+
+        finally:
+            del query_embedding
+
+            if "similarities" in locals():
+                del similarities
+
+            if "indices" in locals():
+                del indices
+
+            gc.collect()
