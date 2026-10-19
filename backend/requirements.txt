@@ -1,36 +1,11 @@
-# # torch
-# # torchvision
-# # transformers
-# # opencv-python
-# # numpy
-# # Pillow
-# # scikit-learn
-# # tqdm
-# # safetensors
-# # flask
-# # flask-cors
-# # onnx
-# # onnxruntime
-# onnxruntime
-# numpy
-# Pillow
-# opencv-python-headless
-# flask
-# flask-cors
-# pymongo
-# certifi
-# python-dotenv
-# gunicorn
-
-
-Flask
-flask-cors
-gunicorn
+torch
+torchvision
+transformers
+opencv-python
 numpy
 Pillow
-opencv-python-headless
-onnxruntime
-pymongo
-dnspython
-certifi
-python-dotenv
+scikit-learn
+tqdm
+safetensors
+flask
+flask-cors
