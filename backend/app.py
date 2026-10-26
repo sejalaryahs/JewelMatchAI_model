@@ -38,8 +38,26 @@ matcher = JewelleryMatcher(model_loader)
 
 
 # ============================================================
-# HEALTH CHECK
+# HOME & HEALTH CHECK
 # ============================================================
+
+
+@app.route(
+    '/',
+    methods=['GET'],
+)
+def home():
+    return jsonify(
+        {
+            'status': 'ok',
+            'message': 'JewelMatch AI Matcher API is running successfully!',
+            'endpoints': {
+                'health': '/api/health',
+                'match': 'POST /api/match',
+                'stored_image': 'GET /catalogue-image/stored/<gridfs_id>',
+            },
+        }
+    )
 
 
 @app.route(
