@@ -1,0 +1,13 @@
+
+Flask
+Flask-CORS
+python-dotenv
+numpy
+Pillow
+torch
+torchvision
+transformers
+onnxruntime
+pymongo
+pillow
+scikit-learn
