@@ -1,605 +1,342 @@
-# ============================================================
-# JEWELLERY IMAGE SEGMENTATION
-# ============================================================
-#
-# Purpose:
-#   Automatically isolate the jewellery from the background.
-#
-# Important:
-#   - Does NOT depend on jewellery colour.
-#   - Works for gold, green prototype, silver, etc.
-#   - Uses GrabCut for foreground/background separation.
-#   - Preserves internal holes/open areas in jewellery designs.
-#   - Keeps the original image if segmentation confidence is low.
-#
-# ============================================================
+from pathlib import Path
+from functools import lru_cache
 
-from __future__ import annotations
-
-import cv2
-import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 # ============================================================
-# CONFIGURATION
+# PROJECT PATHS
 # ============================================================
 
-MIN_IMAGE_SIZE = 80
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Percentage of image border used as definite background.
-BORDER_RATIO = 0.03
+DATASET_DIR = PROJECT_ROOT / "dataset"
 
-# Minimum foreground area relative to complete image.
-MIN_FOREGROUND_RATIO = 0.005
+GOLD_DIR = DATASET_DIR / "gold"
 
-# Maximum foreground area relative to complete image.
-MAX_FOREGROUND_RATIO = 0.90
+PROTOTYPE_DIR = DATASET_DIR / "prototypes"
 
-# GrabCut iterations.
-GRABCUT_ITERATIONS = 5
+SEGMENTED_DIR = DATASET_DIR / "segmented"
+
+GOLD_OUTPUT_DIR = SEGMENTED_DIR / "gold"
+
+PROTOTYPE_OUTPUT_DIR = SEGMENTED_DIR / "prototypes"
 
 
 # ============================================================
-# BASIC VALIDATION
+# SEGMENTATION CONFIGURATION
+# ============================================================
+
+MODEL_NAME = "u2netp"
+
+IMAGE_SIZE = 224
+
+BACKGROUND_COLOR = (255, 255, 255)
+
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+}
+
+
+# ============================================================
+# CREATE OUTPUT DIRECTORIES
+# ============================================================
+
+GOLD_OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+PROTOTYPE_OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+
+# ============================================================
+# IMAGE UTILITIES
 # ============================================================
 
 
-def _validate_image(image: Image.Image) -> Image.Image:
-    """
-    Make sure the input is a valid RGB PIL image.
-    """
+def is_image_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
 
-    if image is None:
-        raise ValueError("Image is None.")
+
+def list_images(directory: Path) -> list[Path]:
+
+    if not directory.exists():
+
+        raise FileNotFoundError(f"Directory does not exist: {directory}")
+
+    images = []
+
+    for path in directory.rglob("*"):
+
+        if is_image_file(path):
+
+            images.append(path)
+
+    return sorted(images)
+
+
+# ============================================================
+# LOAD SEGMENTATION MODEL
+# ============================================================
+
+
+@lru_cache(maxsize=1)
+def get_segmentation_session():
+
+    from rembg import new_session
+
+    print()
+    print("Loading segmentation model...")
+    print("Model:", MODEL_NAME)
+
+    session = new_session(MODEL_NAME)
+
+    print("Segmentation model loaded successfully.")
+
+    return session
+
+
+# ============================================================
+# IMAGE RESIZING
+# ============================================================
+
+
+def resize_and_pad(
+    image: Image.Image,
+    image_size: int = IMAGE_SIZE,
+    background_color=BACKGROUND_COLOR,
+) -> Image.Image:
 
     image = image.convert("RGB")
 
-    width, height = image.size
+    image.thumbnail(
+        (image_size, image_size),
+        Image.Resampling.LANCZOS,
+    )
 
-    if width < MIN_IMAGE_SIZE or height < MIN_IMAGE_SIZE:
-        raise ValueError(f"Image is too small for segmentation: {width}x{height}")
+    canvas = Image.new(
+        "RGB",
+        (image_size, image_size),
+        background_color,
+    )
 
-    return image
+    x = (image_size - image.width) // 2
 
+    y = (image_size - image.height) // 2
 
-# ============================================================
-# PIL -> OPENCV
-# ============================================================
-
-
-def _pil_to_cv(image: Image.Image) -> np.ndarray:
-    """
-    Convert PIL RGB image to OpenCV BGR image.
-    """
-
-    rgb = np.array(image)
-
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-    return bgr
-
-
-# ============================================================
-# OPENCV -> PIL
-# ============================================================
-
-
-def _cv_to_pil(image: np.ndarray) -> Image.Image:
-    """
-    Convert OpenCV BGR image to PIL RGB image.
-    """
-
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    return Image.fromarray(rgb)
-
-
-# ============================================================
-# CREATE INITIAL GRABCUT MASK
-# ============================================================
-
-
-def _create_initial_mask(image: np.ndarray) -> np.ndarray:
-    """
-    Create an initial GrabCut mask.
-
-    Assumption:
-        Jewellery is generally somewhere inside the image.
-
-    Border:
-        Definite background.
-
-    Centre:
-        Probable foreground.
-
-    This is deliberately colour-independent.
-    """
-
-    height, width = image.shape[:2]
-
-    mask = np.full((height, width), cv2.GC_PR_BGD, dtype=np.uint8)
-
-    # --------------------------------------------------------
-    # Definite background around image border
-    # --------------------------------------------------------
-
-    border_x = max(1, int(width * BORDER_RATIO))
-    border_y = max(1, int(height * BORDER_RATIO))
-
-    mask[:border_y, :] = cv2.GC_BGD
-    mask[-border_y:, :] = cv2.GC_BGD
-    mask[:, :border_x] = cv2.GC_BGD
-    mask[:, -border_x:] = cv2.GC_BGD
-
-    # --------------------------------------------------------
-    # Centre region = probable foreground
-    #
-    # We intentionally use a generous region because rings
-    # can be tilted or occupy different parts of the image.
-    # --------------------------------------------------------
-
-    x1 = int(width * 0.12)
-    y1 = int(height * 0.12)
-
-    x2 = int(width * 0.88)
-    y2 = int(height * 0.88)
-
-    mask[y1:y2, x1:x2] = cv2.GC_PR_FGD
-
-    # --------------------------------------------------------
-    # Centre-most area gets stronger foreground probability.
-    # --------------------------------------------------------
-
-    cx1 = int(width * 0.25)
-    cy1 = int(height * 0.20)
-
-    cx2 = int(width * 0.75)
-    cy2 = int(height * 0.80)
-
-    mask[cy1:cy2, cx1:cx2] = cv2.GC_PR_FGD
-
-    return mask
-
-
-# ============================================================
-# GRABCUT
-# ============================================================
-
-
-def _run_grabcut(image: np.ndarray) -> np.ndarray:
-    """
-    Run GrabCut using a mask initialized from image geometry.
-    """
-
-    mask = _create_initial_mask(image)
-
-    background_model = np.zeros((1, 65), np.float64)
-    foreground_model = np.zeros((1, 65), np.float64)
-
-    cv2.grabCut(
+    canvas.paste(
         image,
-        mask,
-        None,
-        background_model,
-        foreground_model,
-        GRABCUT_ITERATIONS,
-        cv2.GC_INIT_WITH_MASK,
+        (x, y),
     )
 
-    # --------------------------------------------------------
-    # GrabCut output:
-    #
-    # GC_FGD     = definite foreground
-    # GC_PR_FGD  = probable foreground
-    #
-    # Both are treated as jewellery.
-    # --------------------------------------------------------
-
-    foreground_mask = np.where(
-        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
-    ).astype(np.uint8)
-
-    return foreground_mask
+    return canvas
 
 
 # ============================================================
-# MORPHOLOGICAL CLEANUP
+# PREPARE IMAGE
 # ============================================================
 
 
-def _clean_mask(mask: np.ndarray) -> np.ndarray:
-    """
-    Remove tiny noise while keeping the jewellery structure.
-    """
+def prepare_image(input_path: str | Path) -> Image.Image:
 
-    height, width = mask.shape[:2]
+    input_path = Path(input_path)
 
-    kernel_size = max(3, int(min(height, width) * 0.01))
+    if not input_path.exists():
 
-    # Make kernel odd.
-    if kernel_size % 2 == 0:
-        kernel_size += 1
+        raise FileNotFoundError(f"Input image not found: {input_path}")
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    with Image.open(input_path) as image:
 
-    # Close very small breaks.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # Correct image orientation using EXIF metadata.
+        image = ImageOps.exif_transpose(image)
 
-    # Remove tiny isolated noise.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        # Convert image to RGB.
+        image = image.convert("RGB")
 
-    return mask
+        return image.copy()
 
 
 # ============================================================
-# KEEP RELEVANT FOREGROUND
+# SEGMENT JEWELLERY
 # ============================================================
 
 
-def _keep_relevant_components(mask: np.ndarray) -> np.ndarray:
-    """
-    Keep the main jewellery component WITHOUT filling its
-    internal holes.
+def segment_jewellery(
+    input_path: str | Path,
+    output_path: str | Path,
+) -> Path:
 
-    This is important for jewellery because:
-        - decorative cut-outs are part of the design
-        - ring openings must remain background
-        - engraved/open patterns must be preserved
+    input_path = Path(input_path)
 
-    We therefore work directly with the existing binary mask
-    instead of drawing a filled contour.
-    """
+    output_path = Path(output_path)
 
-    height, width = mask.shape[:2]
+    if not input_path.exists():
 
-    # --------------------------------------------------------
-    # Find connected components directly from the mask.
-    #
-    # Unlike cv2.drawContours(..., FILLED), this preserves
-    # holes that already exist inside the foreground.
-    # --------------------------------------------------------
+        raise FileNotFoundError(f"Input image not found: {input_path}")
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask, connectivity=8
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    if num_labels <= 1:
-        return mask
+    # Load original image.
+    original = prepare_image(input_path)
 
-    image_area = float(height * width)
+    # Reuse the segmentation model.
+    session = get_segmentation_session()
 
-    components = []
+    # Import rembg only when required.
+    from rembg import remove
 
-    for label in range(1, num_labels):
+    # Remove background.
+    result = remove(
+        original,
+        session=session,
+    )
 
-        area = stats[label, cv2.CC_STAT_AREA]
+    # Convert output to RGBA.
+    result = result.convert("RGBA")
 
-        if area <= 0:
-            continue
+    # Create white background.
+    background = Image.new(
+        "RGBA",
+        result.size,
+        (
+            BACKGROUND_COLOR[0],
+            BACKGROUND_COLOR[1],
+            BACKGROUND_COLOR[2],
+            255,
+        ),
+    )
 
-        ratio = area / image_area
+    # Composite jewellery onto white background.
+    background.alpha_composite(result)
 
-        # Ignore extremely tiny noise.
-        if ratio < 0.001:
-            continue
+    # Convert to RGB.
+    final_image = background.convert("RGB")
 
-        components.append((label, area))
+    # Resize and pad.
+    final_image = resize_and_pad(
+        final_image,
+        IMAGE_SIZE,
+    )
 
-    if not components:
-        return mask
+    # Save processed image.
+    final_image.save(
+        output_path,
+        format="JPEG",
+        quality=95,
+    )
 
-    # --------------------------------------------------------
-    # Largest connected jewellery component.
-    # --------------------------------------------------------
-
-    components.sort(key=lambda item: item[1], reverse=True)
-
-    largest_label, largest_area = components[0]
-
-    # --------------------------------------------------------
-    # Create output mask using the ORIGINAL pixels.
-    #
-    # This is the important part:
-    #
-    # We copy the original mask pixels belonging to the
-    # component instead of filling its outer contour.
-    #
-    # Therefore internal holes remain holes.
-    # --------------------------------------------------------
-
-    result = np.where(labels == largest_label, 255, 0).astype(np.uint8)
-
-    # --------------------------------------------------------
-    # Occasionally a jewellery item can consist of multiple
-    # touching/near-touching components.
-    #
-    # Keep reasonably large components close to the main one.
-    # --------------------------------------------------------
-
-    for label, area in components[1:]:
-
-        if area < largest_area * 0.08:
-            continue
-
-        component_mask = np.where(labels == label, 255, 0).astype(np.uint8)
-
-        # Bounding box of this component.
-        coords = cv2.findNonZero(component_mask)
-
-        if coords is None:
-            continue
-
-        x, y, w, h = cv2.boundingRect(coords)
-
-        # Centre of component.
-        component_cx = x + (w / 2)
-        component_cy = y + (h / 2)
-
-        # Bounding box of main component.
-        main_x = stats[largest_label, cv2.CC_STAT_LEFT]
-        main_y = stats[largest_label, cv2.CC_STAT_TOP]
-        main_w = stats[largest_label, cv2.CC_STAT_WIDTH]
-        main_h = stats[largest_label, cv2.CC_STAT_HEIGHT]
-
-        main_cx = main_x + (main_w / 2)
-        main_cy = main_y + (main_h / 2)
-
-        # Distance between component centres.
-        distance = np.sqrt(
-            (component_cx - main_cx) ** 2 + (component_cy - main_cy) ** 2
-        )
-
-        max_distance = max(width, height) * 0.35
-
-        if distance <= max_distance:
-
-            result[component_mask > 0] = 255
-
-    return result
+    return output_path
 
 
 # ============================================================
-# VALIDATE SEGMENTATION
+# PROCESS DATASET DIRECTORY
 # ============================================================
 
 
-def _segmentation_is_reasonable(mask: np.ndarray) -> bool:
-    """
-    Check whether segmentation produced a plausible amount
-    of foreground.
-    """
+def process_directory(
+    input_directory: Path,
+    output_directory: Path,
+):
 
-    foreground_pixels = np.count_nonzero(mask)
+    input_directory = Path(input_directory)
 
-    total_pixels = mask.shape[0] * mask.shape[1]
+    output_directory = Path(output_directory)
 
-    ratio = foreground_pixels / float(total_pixels)
+    images = list_images(input_directory)
 
-    if ratio < MIN_FOREGROUND_RATIO:
-        return False
+    print()
+    print("=" * 60)
 
-    if ratio > MAX_FOREGROUND_RATIO:
-        return False
+    print("JEWELLERY SEGMENTATION")
 
-    return True
+    print("=" * 60)
 
+    print("Input:", input_directory)
 
-# ============================================================
-# CROP USING MASK
-# ============================================================
+    print("Output:", output_directory)
 
+    print("Images found:", len(images))
 
-def _crop_to_foreground(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    Crop the image around the detected jewellery.
+    print()
 
-    A small amount of padding is retained so that the jewellery
-    does not touch the image boundary.
-    """
+    success_count = 0
 
-    coordinates = cv2.findNonZero(mask)
+    failed_count = 0
 
-    if coordinates is None:
-        return image
+    for index, image_path in enumerate(
+        images,
+        start=1,
+    ):
 
-    x, y, width, height = cv2.boundingRect(coordinates)
+        try:
 
-    image_height, image_width = image.shape[:2]
+            # Preserve relative folder structure.
+            relative_path = image_path.relative_to(input_directory)
 
-    # --------------------------------------------------------
-    # Add padding.
-    # --------------------------------------------------------
+            # Save segmented images as JPEG.
+            output_path = output_directory / relative_path.with_suffix(".jpg")
 
-    padding_x = max(5, int(width * 0.08))
-    padding_y = max(5, int(height * 0.08))
+            # Segment image.
+            segment_jewellery(
+                image_path,
+                output_path,
+            )
 
-    x1 = max(0, x - padding_x)
-    y1 = max(0, y - padding_y)
+            success_count += 1
 
-    x2 = min(image_width, x + width + padding_x)
+            print(f"[{index}/{len(images)}] " f"SUCCESS: {image_path.name}")
 
-    y2 = min(image_height, y + height + padding_y)
+        except Exception as error:
 
-    return image[y1:y2, x1:x2]
+            failed_count += 1
 
+            print(f"[{index}/{len(images)}] " f"FAILED: {image_path.name}")
 
-# ============================================================
-# APPLY MASK TO IMAGE
-# ============================================================
+            print("Reason:", error)
 
+    print()
 
-def _apply_mask(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    Apply segmentation mask.
+    print("SEGMENTATION COMPLETED")
 
-    Background becomes a neutral light background.
+    print("Successful:", success_count)
 
-    IMPORTANT:
-        We do not fill internal holes in the jewellery.
-        Those holes are part of the design.
-    """
+    print("Failed:", failed_count)
 
-    foreground = cv2.bitwise_and(image, image, mask=mask)
+    print("=" * 60)
 
-    # --------------------------------------------------------
-    # Neutral background.
-    # --------------------------------------------------------
-
-    background = np.full_like(image, 245, dtype=np.uint8)
-
-    inverse_mask = cv2.bitwise_not(mask)
-
-    background_part = cv2.bitwise_and(background, background, mask=inverse_mask)
-
-    result = cv2.add(foreground, background_part)
-
-    return result
+    return success_count, failed_count
 
 
 # ============================================================
-# MAIN SEGMENTATION FUNCTION
-# ============================================================
-
-
-def prepare_ring_image(image: Image.Image, return_debug: bool = False):
-    """
-    Main jewellery segmentation function.
-
-    Parameters
-    ----------
-    image:
-        PIL RGB image.
-
-    return_debug:
-        If True, returns additional segmentation information.
-
-    Returns
-    -------
-    PIL.Image
-
-        Segmented/cropped jewellery image.
-
-    If return_debug=True:
-        {
-            "original": PIL.Image,
-            "mask": PIL.Image,
-            "segmented": PIL.Image,
-            "success": bool
-        }
-    """
-
-    original = _validate_image(image)
-
-    cv_image = _pil_to_cv(original)
-
-    # --------------------------------------------------------
-    # Run GrabCut.
-    # --------------------------------------------------------
-
-    mask = _run_grabcut(cv_image)
-
-    # --------------------------------------------------------
-    # Clean mask.
-    # --------------------------------------------------------
-
-    mask = _clean_mask(mask)
-
-    # --------------------------------------------------------
-    # Keep relevant jewellery components.
-    # --------------------------------------------------------
-
-    mask = _keep_relevant_components(mask)
-
-    # --------------------------------------------------------
-    # Validate result.
-    # --------------------------------------------------------
-
-    success = _segmentation_is_reasonable(mask)
-
-    if not success:
-
-        # ----------------------------------------------------
-        # Safety fallback:
-        #
-        # If automatic segmentation looks unreliable, return
-        # the original image rather than destroying the ring.
-        # ----------------------------------------------------
-
-        segmented = cv_image.copy()
-
-    else:
-
-        # ----------------------------------------------------
-        # Apply mask.
-        # ----------------------------------------------------
-
-        segmented = _apply_mask(cv_image, mask)
-
-        # ----------------------------------------------------
-        # Crop around jewellery.
-        # ----------------------------------------------------
-
-        segmented = _crop_to_foreground(segmented, mask)
-
-    segmented_pil = _cv_to_pil(segmented)
-
-    if not return_debug:
-        return segmented_pil
-
-    mask_pil = Image.fromarray(mask)
-
-    return {
-        "original": original,
-        "mask": mask_pil,
-        "segmented": segmented_pil,
-        "success": success,
-    }
-
-
-# ============================================================
-# TESTING FUNCTION
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
-    print("=" * 70)
-    print("JEWELLERY SEGMENTATION TEST")
-    print("=" * 70)
+    print("Jewellery Segmentation Module")
 
-    test_path = (
-        input("\nEnter the full path of a jewellery image:\n> ").strip().strip('"')
-    )
+    print("Project:", PROJECT_ROOT)
 
-    if not test_path:
+    print()
+    print("Gold dataset:", GOLD_DIR)
 
-        print("\nNo image path supplied.")
-        raise SystemExit(1)
+    print("Prototype dataset:", PROTOTYPE_DIR)
 
-    try:
+    print()
+    print("Segmented gold:", GOLD_OUTPUT_DIR)
 
-        image = Image.open(test_path).convert("RGB")
+    print("Segmented prototypes:", PROTOTYPE_OUTPUT_DIR)
 
-        result = prepare_ring_image(image, return_debug=True)
-
-        print(f"\nSegmentation successful: " f"{result['success']}")
-
-        original_path = "segmentation_original.jpg"
-        mask_path = "segmentation_mask.png"
-        result_path = "segmentation_result.jpg"
-
-        result["original"].save(original_path)
-        result["mask"].save(mask_path)
-        result["segmented"].save(result_path)
-
-        print("\nFiles created:")
-        print(f"Original:    {original_path}")
-        print(f"Mask:        {mask_path}")
-        print(f"Segmented:   {result_path}")
-
-        print("\nSegmentation test completed.")
-
-    except Exception as exc:
-
-        print("\nERROR:")
-        print(exc)
-        raise
+    print()
+    print("This module provides segmentation functions.")
+    print("Use the dataset segmentation script to process images.")

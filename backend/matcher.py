@@ -1,361 +1,381 @@
-# ============================================================
-# JEWELMATCH AI - MONGODB STORED-EMBEDDING MATCHER
-# ============================================================
-
-import gc
+from typing import Any
 
 import numpy as np
-from bson import ObjectId
 
-from .database.mongodb import get_jewellery_collection
-from .model_loader import ModelLoader
+# ============================================================
+# JEWELLERY MATCHER
+# MODEL 3 - ONNX VERSION - NUMPY
+# BIDIRECTIONAL MATCHING
+# ============================================================
 
 
 class JewelleryMatcher:
-    """Match jewellery using embeddings stored in MongoDB."""
 
-    EMBEDDING_DIM = 512
-    MODEL_VERSION = "jewellery_dinov2_onnx_v1:cdae8a24b1a605da"
+    def __init__(
+        self,
+        embedding_dim: int = 512,
+        top_k: int = 12,
+        similarity_threshold: float = 0.0,
+    ):
 
-    def __init__(self, model_loader: ModelLoader):
-        self.model_loader = model_loader
-        self.database = get_jewellery_collection().database
+        self.embedding_dim = embedding_dim
+        self.top_k = top_k
+        self.similarity_threshold = similarity_threshold
 
-        self.collections = {
-            "gold": self.database["gold"],
-            "prototype": self.database["prototype"],
-        }
+        print("=" * 60)
+        print("JEWELLERY MATCHER - ONNX")
+        print("=" * 60)
+        print("Embedding dimension:", embedding_dim)
+        print("Top K:", top_k)
+        print("Similarity threshold:", similarity_threshold)
+        print("Matching: Bidirectional")
+        print("=" * 60)
 
-        self.catalogue = {
-            "gold": [],
-            "prototype": [],
-        }
+    # ========================================================
+    # CONVERT EMBEDDING TO NUMPY
+    # ========================================================
 
-        self.embeddings = {
-            "gold": None,
-            "prototype": None,
-        }
+    def _to_numpy(
+        self,
+        embedding: Any,
+    ) -> np.ndarray:
 
-        self._loaded_domain = None
-
-        print()
-        print("=" * 70)
-        print("INITIALIZING JEWELMATCH STORED-EMBEDDING MATCHER")
-        print("=" * 70)
-        print(f"MongoDB database : {self.database.name}")
-        print("Gold records     : " f"{self.collections['gold'].count_documents({})}")
-        print(
-            "Prototype records: " f"{self.collections['prototype'].count_documents({})}"
-        )
-        print(f"Embedding model  : {self.MODEL_VERSION}")
-        print("[INFO] Catalogue embeddings are read from MongoDB.")
-        print("[INFO] Catalogue images are not re-embedded.")
-        print("[INFO] Catalogue cache is cleared after each match.")
-        print("=" * 70)
-
-    def _get_gridfs_id(self, item):
-        if not item:
-            return None
-
-        value = item.get("image_gridfs_id")
-
-        if not value:
-            return None
+        if hasattr(embedding, "detach"):
+            embedding = embedding.detach().cpu().numpy()
 
         try:
-            if isinstance(value, ObjectId):
-                return value
-            return ObjectId(str(value))
-        except Exception:
-            return None
-
-    def _get_item_id(self, item):
-        for field in ("id", "design_id", "jewellery_id", "item_id"):
-            value = item.get(field)
-            if value is not None:
-                return str(value)
-
-        mongo_id = item.get("_id")
-        return str(mongo_id) if mongo_id is not None else None
-
-    def _get_filename(self, item):
-        for field in (
-            "filename",
-            "image_filename",
-            "original_filename",
-            "image_name",
-        ):
-            value = item.get(field)
-            if value:
-                return str(value)
-
-        return None
-
-    def _create_embedding(self, image):
-        """Generate an embedding for the uploaded query image."""
-        embedding = self.model_loader.get_embedding(image)
-
-        embedding = np.asarray(
-            embedding,
-            dtype=np.float32,
-        ).reshape(-1)
-
-        if embedding.size != self.EMBEDDING_DIM:
-            raise ValueError(
-                f"Unexpected embedding dimension: expected "
-                f"{self.EMBEDDING_DIM}, received {embedding.size}"
-            )
-
-        if not np.all(np.isfinite(embedding)):
-            raise ValueError("Query embedding contains NaN or infinite values.")
-
-        norm = float(np.linalg.norm(embedding))
-
-        if norm <= 0:
-            raise ValueError("Query embedding has zero magnitude.")
-
-        normalized = embedding / norm
-        return normalized.astype(np.float32, copy=False)
-
-    def _clear_catalogue_cache(self):
-        """Remove references to cached catalogue records and vectors."""
-        self.catalogue["gold"] = []
-        self.catalogue["prototype"] = []
-
-        self.embeddings["gold"] = None
-        self.embeddings["prototype"] = None
-
-        self._loaded_domain = None
-
-    def _load_catalogue(self, domain):
-        """Load validated precomputed embeddings from MongoDB."""
-        if domain not in ("gold", "prototype"):
-            raise ValueError("domain must be 'gold' or 'prototype'")
-
-        print()
-        print("=" * 70)
-        print(f"LOADING STORED {domain.upper()} EMBEDDINGS")
-        print("=" * 70)
-
-        collection = self.collections[domain]
-
-        valid_records = []
-        vectors = []
-
-        total_records = 0
-        missing_embedding = 0
-        wrong_model = 0
-        invalid_embedding = 0
-        missing_image_id = 0
-
-        for item in collection.find({}):
-            total_records += 1
-
-            if item.get("embedding_model") != self.MODEL_VERSION:
-                wrong_model += 1
-                continue
-
-            stored_embedding = item.get("embedding")
-
-            if stored_embedding is None:
-                missing_embedding += 1
-                continue
-
-            try:
-                vector = np.asarray(
-                    stored_embedding,
-                    dtype=np.float32,
-                ).reshape(-1)
-
-                if vector.size != self.EMBEDDING_DIM:
-                    invalid_embedding += 1
-                    continue
-
-                if not np.all(np.isfinite(vector)):
-                    invalid_embedding += 1
-                    continue
-
-                norm = float(np.linalg.norm(vector))
-
-                if not np.isfinite(norm) or norm <= 0:
-                    invalid_embedding += 1
-                    continue
-
-                vector = vector / norm
-                gridfs_id = self._get_gridfs_id(item)
-
-                if gridfs_id is None:
-                    missing_image_id += 1
-
-                valid_records.append(
-                    {
-                        "record": item,
-                        "gridfs_id": gridfs_id,
-                    }
-                )
-                vectors.append(vector)
-
-            except (TypeError, ValueError, OverflowError) as exc:
-                invalid_embedding += 1
-                print(
-                    "[WARNING] Invalid stored embedding for "
-                    f"{item.get('_id')}: {exc}"
-                )
-
-        if vectors:
-            matrix = np.vstack(vectors).astype(
-                np.float32,
-                copy=False,
-            )
-        else:
-            matrix = np.empty(
-                (0, self.EMBEDDING_DIM),
+            array = np.asarray(
+                embedding,
                 dtype=np.float32,
             )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Unable to convert embedding to NumPy: {error}"
+            ) from error
 
-        self.catalogue[domain] = valid_records
-        self.embeddings[domain] = matrix
-        self._loaded_domain = domain
+        # Handle a single batch.
+        if array.ndim == 2:
 
-        print(f"Total MongoDB records : {total_records}")
-        print(f"Loaded embeddings     : {len(valid_records)}")
-        print(f"Missing embeddings    : {missing_embedding}")
-        print(f"Wrong model version   : {wrong_model}")
-        print(f"Invalid embeddings    : {invalid_embedding}")
-        print(f"Missing image IDs     : {missing_image_id}")
-        print(f"Embedding matrix shape: {matrix.shape}")
+            if array.shape[0] != 1:
+                raise ValueError(f"Expected one embedding, received {array.shape}")
 
-        if not valid_records and total_records:
-            print(
-                "[WARNING] No usable stored embeddings were found. "
-                "Check embedding_model and embedding fields."
+            array = array.squeeze(0)
+
+        if array.ndim != 1:
+            raise ValueError(f"Embedding must be 1D, received {array.shape}")
+
+        if array.size != self.embedding_dim:
+            raise ValueError(
+                f"Expected {self.embedding_dim} dimensions, " f"received {array.size}"
             )
 
-        print(f"[INFO] Target catalogue loaded: {domain}")
-        print("=" * 70)
+        if not np.isfinite(array).all():
+            raise ValueError("Embedding contains NaN or infinite values.")
 
-    def _ensure_catalogue_loaded(self, target):
-        if target not in ("gold", "prototype"):
-            raise ValueError("target must be 'gold' or 'prototype'")
+        norm = np.linalg.norm(array)
 
-        if self._loaded_domain == target and self.embeddings[target] is not None:
-            return
+        if norm <= 1e-12:
+            raise ValueError("Embedding has zero magnitude.")
 
-        self._clear_catalogue_cache()
-        self._load_catalogue(target)
+        return (array / norm).astype(np.float32)
 
-    def find_matches(self, image, source, top_k=12):
-        """Match one uploaded image and clear temporary cache afterwards."""
-        query_embedding = None
-        catalogue_embeddings = None
-        catalogue_records = None
-        similarities = None
-        ranking = None
-        results = []
+    # ========================================================
+    # PREPARE QUERY
+    # ========================================================
 
-        try:
-            if source not in ("gold", "prototype"):
-                raise ValueError("source must be 'gold' or 'prototype'")
+    def prepare_query(
+        self,
+        query_embedding: Any,
+    ) -> np.ndarray:
+
+        return self._to_numpy(query_embedding)
+
+    # ========================================================
+    # PREPARE CATALOGUE EMBEDDINGS
+    # ========================================================
+
+    def prepare_prototype_embeddings(
+        self,
+        prototype_embeddings: list[Any],
+    ) -> np.ndarray:
+
+        if not prototype_embeddings:
+            raise ValueError("No catalogue embeddings provided.")
+
+        embeddings = []
+
+        for index, embedding in enumerate(prototype_embeddings):
 
             try:
-                top_k = int(top_k)
-            except (TypeError, ValueError):
-                top_k = 5
+                embeddings.append(self._to_numpy(embedding))
 
-            top_k = max(1, min(top_k, 50))
-            target = "prototype" if source == "gold" else "gold"
+            except (
+                ValueError,
+                TypeError,
+                RuntimeError,
+            ) as error:
 
-            print()
-            print("=" * 70)
-            print("JEWELLERY MATCH")
-            print("=" * 70)
-            print(f"Source : {source}")
-            print(f"Target : {target}")
+                raise ValueError(
+                    f"Invalid embedding at index {index}: {error}"
+                ) from error
 
-            query_embedding = self._create_embedding(image)
-            self._ensure_catalogue_loaded(target)
+        return np.stack(
+            embeddings,
+            axis=0,
+        )
 
-            catalogue_embeddings = self.embeddings[target]
-            catalogue_records = self.catalogue[target]
+    # ========================================================
+    # COSINE SIMILARITY
+    # ========================================================
 
-            print(f"Target records: {len(catalogue_records)}")
+    def calculate_similarity(
+        self,
+        query_embedding: Any,
+        prototype_embeddings: list[Any],
+    ) -> np.ndarray:
 
-            if not catalogue_records:
-                print(f"[INFO] No usable {target} embeddings available.")
-                return []
+        query = self.prepare_query(query_embedding)
 
-            # Preserve the existing cosine-similarity and ranking logic.
-            similarities = catalogue_embeddings @ query_embedding
-            ranking = np.argsort(similarities)[::-1][:top_k]
+        prototypes = self.prepare_prototype_embeddings(prototype_embeddings)
 
-            for index in ranking:
-                index = int(index)
+        return np.matmul(
+            prototypes,
+            query,
+        )
 
-                item_data = catalogue_records[index]
-                item = item_data["record"]
-                gridfs_id = item_data["gridfs_id"]
-                similarity = float(similarities[index])
+    # ========================================================
+    # MATCH CATALOGUE ITEMS
+    # ========================================================
 
-                result = {
-                    "id": self._get_item_id(item),
-                    "mongo_id": str(item.get("_id")),
-                    "filename": self._get_filename(item),
-                    "domain": target,
-                    "image_gridfs_id": (
-                        str(gridfs_id) if gridfs_id is not None else None
-                    ),
-                    "similarity": similarity,
-                    "similarity_percent": round(
-                        max(0.0, min(1.0, similarity)) * 100,
-                        2,
-                    ),
-                }
+    def match(
+        self,
+        query_embedding: Any,
+        prototypes: list[dict],
+        top_k: int | None = None,
+        similarity_threshold: float | None = None,
+    ) -> list[dict]:
 
-                for field in (
-                    "design_id",
-                    "name",
-                    "design_name",
-                    "type",
-                    "subtype",
-                    "description",
-                    "collection",
-                ):
-                    if field in item:
-                        value = item[field]
+        # ----------------------------------------------------
+        # EMPTY CATALOGUE
+        # ----------------------------------------------------
 
-                        if isinstance(value, ObjectId):
-                            value = str(value)
+        if not prototypes:
+            return []
 
-                        result[field] = value
+        # ----------------------------------------------------
+        # TOP K
+        # ----------------------------------------------------
 
-                results.append(result)
+        if top_k is None:
+            top_k = self.top_k
 
-            print(f"Valid matches: {len(results)}")
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
 
-            for rank, result in enumerate(results, start=1):
-                print(
-                    f"{rank}. {result.get('id')} -> " f"{result['similarity_percent']}%"
-                )
+        # ----------------------------------------------------
+        # SIMILARITY THRESHOLD
+        # ----------------------------------------------------
 
-            print("=" * 70)
+        if similarity_threshold is None:
+            similarity_threshold = self.similarity_threshold
 
-            # Return independent result dictionaries. They do not depend
-            # on the catalogue cache after this method returns.
-            return results
+        if not -1.0 <= similarity_threshold <= 1.0:
+            raise ValueError("Similarity threshold must be between -1 and 1.")
 
-        finally:
-            # Remove references to temporary NumPy arrays.
-            query_embedding = None
-            catalogue_embeddings = None
-            catalogue_records = None
-            similarities = None
-            ranking = None
+        # ----------------------------------------------------
+        # PREPARE QUERY
+        # ----------------------------------------------------
 
-            # Clear both in-memory catalogue caches. MongoDB data is
-            # untouched and will be loaded again for the next request.
-            self._clear_catalogue_cache()
+        query = self.prepare_query(query_embedding)
 
-            # Ask Python to collect unreachable objects.
-            gc.collect()
+        # ----------------------------------------------------
+        # PREPARE VALID CATALOGUE ITEMS
+        # ----------------------------------------------------
 
-            print("[CLEANUP] Matching arrays and catalogue cache cleared.")
+        valid_items = []
+        embeddings = []
+
+        for item in prototypes:
+
+            if not isinstance(item, dict):
+                continue
+
+            embedding = item.get("embedding")
+
+            if embedding is None:
+                continue
+
+            try:
+                normalized_embedding = self._to_numpy(embedding)
+
+            except (
+                ValueError,
+                TypeError,
+                RuntimeError,
+            ):
+                continue
+
+            valid_items.append(item)
+            embeddings.append(normalized_embedding)
+
+        if not valid_items:
+            return []
+
+        # ----------------------------------------------------
+        # STACK EMBEDDINGS
+        # ----------------------------------------------------
+
+        catalogue_embeddings = np.stack(
+            embeddings,
+            axis=0,
+        )
+
+        # ----------------------------------------------------
+        # COSINE SIMILARITY
+        # ----------------------------------------------------
+
+        similarities = np.matmul(
+            catalogue_embeddings,
+            query,
+        )
+
+        # ----------------------------------------------------
+        # SORT BY SIMILARITY
+        # ----------------------------------------------------
+
+        sorted_indices = np.argsort(similarities)[::-1]
+
+        # ----------------------------------------------------
+        # RETURN TOP 12 VALID RESULTS
+        # ----------------------------------------------------
+
+        results = []
+
+        for index in sorted_indices:
+
+            score = float(similarities[index])
+
+            if score < similarity_threshold:
+                continue
+
+            item = dict(valid_items[index])
+
+            item["similarity"] = score
+
+            item["similarity_percent"] = round(
+                score * 100,
+                2,
+            )
+
+            results.append(item)
+
+            if len(results) >= top_k:
+                break
+
+        return results
+
+    # ========================================================
+    # COMPARE TWO EMBEDDINGS
+    # ========================================================
+
+    def compare(
+        self,
+        query_embedding: Any,
+        prototype_embedding: Any,
+    ) -> float:
+
+        query = self.prepare_query(query_embedding)
+
+        prototype = self._to_numpy(prototype_embedding)
+
+        return float(
+            np.dot(
+                query,
+                prototype,
+            )
+        )
+
+    # ========================================================
+    # FORMAT MATCH INFORMATION
+    # ========================================================
+
+    def get_match_info(
+        self,
+        result: dict,
+    ) -> dict:
+
+        return {
+            "id": result.get("id"),
+            "design_code": result.get("design_code"),
+            "name": result.get("name"),
+            "collection": result.get("collection"),
+            "type": result.get("type"),
+            "description": result.get("description"),
+            "image_path": result.get("image_path"),
+            "image_url": result.get("image_url"),
+            "similarity": result.get("similarity"),
+            "similarity_percent": result.get("similarity_percent"),
+        }
+
+
+# ============================================================
+# TEST MATCHER
+# ============================================================
+
+if __name__ == "__main__":
+
+    print()
+    print("Testing Jewellery Matcher")
+
+    matcher = JewelleryMatcher(
+        embedding_dim=512,
+        top_k=12,
+        similarity_threshold=0.0,
+    )
+
+    # Create sample query embedding.
+    query = np.random.rand(512).astype(np.float32)
+
+    query = query / np.linalg.norm(query)
+
+    # Create 20 sample catalogue embeddings.
+    catalogue = []
+
+    for index in range(20):
+
+        embedding = np.random.rand(512).astype(np.float32)
+
+        embedding = embedding / np.linalg.norm(embedding)
+
+        catalogue.append(
+            {
+                "id": str(index + 1),
+                "design_code": f"DESIGN-{index + 1}",
+                "type": "prototype",
+                "embedding": embedding,
+            }
+        )
+
+    # Test matching.
+    results = matcher.match(
+        query_embedding=query,
+        prototypes=catalogue,
+        top_k=12,
+    )
+
+    print()
+    print("=" * 60)
+    print("MATCHING TEST RESULTS")
+    print("=" * 60)
+
+    print("Requested results:", 12)
+    print("Returned results:", len(results))
+
+    for result in results:
+
+        print(
+            result["design_code"],
+            result["similarity_percent"],
+        )
+
+    print("=" * 60)

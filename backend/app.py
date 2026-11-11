@@ -1,40 +1,95 @@
-import gc
+import tempfile
 from pathlib import Path
 
-from bson import ObjectId
-from flask import (
-    Flask,
-    jsonify,
-    request,
-    send_file,
-    send_from_directory,
-)
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from gridfs import GridFS
-from PIL import Image
 
-from .database.mongodb import get_jewellery_collection
-from .model_loader import ModelLoader
-from .matcher import JewelleryMatcher
-from .segmentation import prepare_ring_image
+from PIL import Image, ImageOps, UnidentifiedImageError
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from backend.config import EMBEDDING_DIM
+from backend.matching_service import JewelleryMatchingService
 
-MATCHING_DATA_DIR = PROJECT_ROOT / "matching_data"
-
+# ============================================================
+# FLASK APP
+# ============================================================
 
 app = Flask(__name__)
 
 CORS(app)
 
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+
 
 # ============================================================
-# LOAD AI MODEL ONCE
+# MODEL CONFIGURATION
 # ============================================================
 
-model_loader = ModelLoader()
+MODEL_VERSION = "jewellery_model3_onnx_v1"
 
-matcher = JewelleryMatcher(model_loader)
+EMBEDDING_DIMENSION = EMBEDDING_DIM
+
+TOP_K = 12
+
+DEFAULT_QUERY_TYPE = "gold"
+
+SUPPORTED_QUERY_TYPES = {
+    "gold",
+    "prototype",
+}
+
+
+# ============================================================
+# MATCHING SERVICE
+# ============================================================
+
+matching_service = None
+
+
+def initialize_matching_service():
+
+    global matching_service
+
+    print()
+    print("=" * 70)
+    print("JEWELLERY MODEL 3 API")
+    print("=" * 70)
+
+    matching_service = JewelleryMatchingService()
+
+    print()
+    print("Matching service initialized successfully.")
+    print("Runtime: ONNX Runtime")
+    print("Embedding dimension:", EMBEDDING_DIMENSION)
+    print("Number of results:", TOP_K)
+    print("Default query type:", DEFAULT_QUERY_TYPE)
+    print("Matching mode: Bidirectional")
+
+    print("=" * 70)
+
+
+# ============================================================
+# JSON SERIALIZATION
+# ============================================================
+
+
+def make_json_safe(value):
+
+    if isinstance(value, dict):
+
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple)):
+
+        return [make_json_safe(item) for item in value]
+
+    if value is None or isinstance(
+        value,
+        (str, int, float, bool),
+    ):
+
+        return value
+
+    return str(value)
 
 
 # ============================================================
@@ -42,242 +97,299 @@ matcher = JewelleryMatcher(model_loader)
 # ============================================================
 
 
-@app.route(
-    "/api/health",
-    methods=["GET"],
-)
-def health():
+@app.route("/", methods=["GET"])
+def home():
 
     return jsonify(
         {
-            "status": "ok",
-            "message": "Jewellery Matcher API is running",
+            "success": True,
+            "message": "Jewellery Model 3 API",
+            "status": "running",
+            "model": MODEL_VERSION,
+            "runtime": "ONNX Runtime",
+            "embedding_dimension": EMBEDDING_DIMENSION,
+            "top_k": TOP_K,
+            "default_query_type": DEFAULT_QUERY_TYPE,
+            "matching_mode": "Bidirectional",
+            "supported_directions": [
+                "Gold -> Prototype",
+                "Prototype -> Gold",
+            ],
+            "matching_service": (
+                "initialized" if matching_service is not None else "not initialized"
+            ),
+            "database": "Supabase",
         }
     )
 
 
 # ============================================================
-# MATCH
+# MATCH JEWELLERY
 # ============================================================
 
 
 @app.route("/api/match", methods=["POST"])
-def match():
-    image = None
-    image_file = None
+def match_jewellery():
 
     try:
-        if "image" not in request.files:
+
+        # ----------------------------------------------------
+        # CHECK MATCHING SERVICE
+        # ----------------------------------------------------
+
+        if matching_service is None:
+
             return (
                 jsonify(
                     {
                         "success": False,
-                        "error": "No image was uploaded.",
+                        "error": "Matching service is not initialized.",
+                    }
+                ),
+                500,
+            )
+
+        # ----------------------------------------------------
+        # CHECK IMAGE UPLOAD
+        # ----------------------------------------------------
+
+        if "image" not in request.files:
+
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "Please upload a jewellery image.",
                     }
                 ),
                 400,
             )
 
-        image_file = request.files["image"]
+        uploaded_file = request.files["image"]
 
-        source = (
+        if not uploaded_file.filename:
+
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "No image selected.",
+                    }
+                ),
+                400,
+            )
+
+        # ----------------------------------------------------
+        # GET QUERY TYPE
+        #
+        # Gold is the default for the current testing frontend.
+        # ----------------------------------------------------
+
+        query_type = (
             request.form.get(
-                "source",
-                "prototype",
+                "query_type",
+                DEFAULT_QUERY_TYPE,
             )
             .strip()
             .lower()
         )
 
-        try:
-            top_k = int(request.form.get("top_k", 5))
-        except (TypeError, ValueError):
-            top_k = 5
+        if not query_type:
 
-        if source not in {"gold", "prototype"}:
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": "Source must be 'gold' or 'prototype'.",
-                    }
-                ),
-                400,
-            )
+            query_type = DEFAULT_QUERY_TYPE
 
-        with Image.open(image_file.stream) as uploaded_image:
-            image = uploaded_image.convert("RGB")
-
-        image = prepare_ring_image(image)
-
-        results = matcher.find_matches(
-            image=image,
-            source=source,
-            top_k=top_k,
-        )
-
-        target = "prototype" if source == "gold" else "gold"
-
-        return jsonify(
-            {
-                "success": True,
-                "source": source,
-                "target": target,
-                "results": results,
-            }
-        )
-
-    except Exception as exc:
-        print(f"[ERROR] /api/match: {exc}")
-
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": str(exc),
-                }
-            ),
-            500,
-        )
-
-    finally:
-        # Close the processed image, if one was created.
-        if image is not None:
-            try:
-                image.close()
-            except Exception:
-                pass
-
-        # Close the uploaded request stream.
-        if image_file is not None:
-            try:
-                image_file.close()
-            except Exception:
-                pass
-
-        # Collect unreachable temporary Python objects.
-        gc.collect()
-
-        print("[CLEANUP] Request image and temporary objects released.")
-
-
-# ============================================================
-# SERVE MONGODB / GRIDFS CATALOGUE IMAGE
-# ============================================================
-
-
-@app.route(
-    "/catalogue-image/stored/<gridfs_id>",
-    methods=["GET"],
-)
-def catalogue_image_stored(
-    gridfs_id,
-):
-
-    try:
-
-        # ----------------------------------------------------
-        # VALIDATE MONGODB OBJECT ID
-        # ----------------------------------------------------
-
-        try:
-
-            object_id = ObjectId(gridfs_id)
-
-        except Exception:
+        if query_type not in SUPPORTED_QUERY_TYPES:
 
             return (
                 jsonify(
                     {
                         "success": False,
-                        "error": "Invalid GridFS image ID.",
+                        "error": ("Invalid query_type. " "Use 'gold' or 'prototype'."),
+                        "supported_types": [
+                            "gold",
+                            "prototype",
+                        ],
                     }
                 ),
                 400,
             )
 
         # ----------------------------------------------------
-        # GET SAME MONGODB DATABASE
+        # DETERMINE TARGET TYPE
         # ----------------------------------------------------
 
-        database = get_jewellery_collection().database
+        if query_type == "gold":
+
+            target_type = "prototype"
+            target_collection = "Prototype"
+
+        else:
+
+            target_type = "gold"
+            target_collection = "Gold"
 
         # ----------------------------------------------------
-        # GRIDFS
+        # VALIDATE IMAGE
         # ----------------------------------------------------
 
-        gridfs = GridFS(database)
+        try:
 
-        # ----------------------------------------------------
-        # CHECK IMAGE
-        # ----------------------------------------------------
+            image = Image.open(uploaded_file.stream)
 
-        if not gridfs.exists(object_id):
+            image.load()
+
+            image = ImageOps.exif_transpose(image)
+
+            image = image.convert("RGB")
+
+        except (
+            UnidentifiedImageError,
+            OSError,
+            ValueError,
+        ):
 
             return (
                 jsonify(
                     {
                         "success": False,
-                        "error": "Stored image not found.",
+                        "error": "Invalid image file.",
                     }
                 ),
-                404,
+                400,
             )
 
         # ----------------------------------------------------
-        # READ GRIDFS FILE
+        # SAVE TEMPORARY QUERY IMAGE
         # ----------------------------------------------------
 
-        grid_file = gridfs.get(object_id)
+        with tempfile.TemporaryDirectory(prefix="jewellery_query_") as temp_dir:
+
+            image_path = Path(temp_dir) / "query_image.jpg"
+
+            image.save(
+                image_path,
+                format="JPEG",
+                quality=95,
+            )
+
+            # ------------------------------------------------
+            # MATCH USING ONNX MODEL AND SUPABASE EMBEDDINGS
+            # ------------------------------------------------
+
+            results = matching_service.match_image(
+                image_path=image_path,
+                query_type=query_type,
+                top_k=TOP_K,
+            )
 
         # ----------------------------------------------------
-        # DETERMINE CONTENT TYPE
+        # FORMAT RESULTS
         # ----------------------------------------------------
 
-        content_type = getattr(
-            grid_file,
-            "content_type",
-            None,
-        )
+        formatted_results = []
 
-        # ----------------------------------------------------
-        # SEND IMAGE TO BROWSER
-        # ----------------------------------------------------
+        for result in results:
 
-        response = send_file(
-            grid_file,
-            mimetype=content_type,
-            download_name=(
-                grid_file.filename
-                if getattr(
-                    grid_file,
-                    "filename",
-                    None,
+            result = make_json_safe(result)
+
+            jewellery_id = result.get("id")
+
+            name = result.get(
+                "name",
+                "Jewellery",
+            )
+
+            design_code = result.get(
+                "design_code",
+            )
+
+            collection = result.get(
+                "collection",
+            )
+
+            jewellery_type = result.get(
+                "type",
+            )
+
+            description = result.get(
+                "description",
+            )
+
+            # ------------------------------------------------
+            # SUPABASE IMAGE
+            # ------------------------------------------------
+
+            image_url = result.get(
+                "image_url",
+            )
+
+            image_path = result.get(
+                "image_path",
+            )
+
+            # ------------------------------------------------
+            # SIMILARITY
+            # ------------------------------------------------
+
+            similarity = float(
+                result.get(
+                    "similarity",
+                    0.0,
                 )
-                else "jewellery-image"
-            ),
-        )
+            )
+
+            # ------------------------------------------------
+            # RESULT OBJECT
+            # ------------------------------------------------
+
+            formatted_results.append(
+                {
+                    "id": str(jewellery_id if jewellery_id is not None else ""),
+                    "name": name,
+                    "design_code": design_code,
+                    "collection": collection,
+                    "type": jewellery_type,
+                    "description": description,
+                    "image": image_url,
+                    "image_url": image_url,
+                    "image_path": image_path,
+                    "similarity": similarity,
+                    "similarity_percentage": round(
+                        similarity * 100,
+                        2,
+                    ),
+                }
+            )
 
         # ----------------------------------------------------
-        # CACHE IMAGE
+        # RESPONSE
         # ----------------------------------------------------
 
-        response.headers["Cache-Control"] = "public, max-age=31536000"
+        response_data = {
+            "success": True,
+            "query_type": query_type,
+            "target_type": target_type,
+            "collection": target_collection,
+            "embedding_model": MODEL_VERSION,
+            "embedding_dimension": EMBEDDING_DIMENSION,
+            "runtime": "ONNX Runtime",
+            "database": "Supabase",
+            "requested_results": TOP_K,
+            "count": len(formatted_results),
+            "results": formatted_results,
+        }
 
-        return response
+        return jsonify(make_json_safe(response_data))
 
-    except Exception as exc:
+    except Exception:
 
-        print(
-            "[ERROR] GridFS image error:",
-            repr(exc),
-        )
+        app.logger.exception("Jewellery matching failed")
 
         return (
             jsonify(
                 {
                     "success": False,
-                    "error": str(exc),
+                    "error": "Jewellery matching failed.",
                 }
             ),
             500,
@@ -285,50 +397,20 @@ def catalogue_image_stored(
 
 
 # ============================================================
-# OLD LOCAL CATALOGUE IMAGE ROUTE
-#
-# Kept temporarily for backwards compatibility.
-# The React application now uses the MongoDB/GridFS route
-# above.
+# START SERVER
 # ============================================================
-
-
-@app.route(
-    "/catalogue/<domain>/<filename>",
-    methods=["GET"],
-)
-def catalogue_image(
-    domain,
-    filename,
-):
-
-    if domain not in {
-        "gold",
-        "prototypes",
-    }:
-
-        return (
-            jsonify({"error": "Invalid domain."}),
-            400,
-        )
-
-    directory = MATCHING_DATA_DIR / domain
-
-    return send_from_directory(
-        directory,
-        filename,
-    )
-
-
-# ============================================================
-# RUN
-# ============================================================
-
 
 if __name__ == "__main__":
 
+    print()
+    print("=" * 70)
+    print("JEWELLERY MODEL 3 BACKEND")
+    print("=" * 70)
+
+    initialize_matching_service()
+
     app.run(
         host="0.0.0.0",
-        port=5000,
-        debug=True,
+        port=5002,
+        debug=False,
     )

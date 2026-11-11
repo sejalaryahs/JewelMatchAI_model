@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+.git/
+node_modules/
+dataset/
+training/
+reports/
+matching_data/
+.env
+*.pyc

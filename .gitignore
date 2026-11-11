@@ -67,3 +67,10 @@ frontend/
 backend/store_embeddings.py
 models/ring_embedding_model.pth
 models/ring_embedding_model_old_loss.pth
+
+
+
+# Model checkpoints
+models/checkpoints/
+*.pt
+*.pth
